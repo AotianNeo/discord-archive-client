@@ -4,7 +4,10 @@
  */
 
 import { DiscordRateLimited, discordFetch, discordRateState } from '../../shared/discord-guard';
-import { isForward, snapshotsFromDiscord } from '../../shared/message-snapshots';
+import { compareSnowflake, toRecord, writeRecords } from './records';
+import { DiscordGateway, gatewayStub } from './gateway';
+
+export { DiscordGateway };
 
 export interface Env {
   DB: D1Database;
@@ -12,123 +15,43 @@ export interface Env {
   DISCORD_GUILD_ID: string;
   GUILD_OWNER_ID?: string;        // 可选：服主 ID，消息上的 owner 标记
   PRIORITY_CHANNEL_IDS?: string;  // 可选：逗号分隔，名额不够时优先同步的频道
+  REALTIME_GATEWAY?: string;      // "true" = 用 Discord 网关实时同步（gateway.ts），REST 轮询降为每 10 分钟补漏
+  GATEWAY: DurableObjectNamespace;
+}
+
+const GATEWAY_HEALTHY_MS = 120_000;   // 网关这么久内有事件才算健康
+const BACKSTOP_EVERY_MINUTES = 10;    // 网关健康时 REST 补漏的间隔
+
+// 网关健康时的分钟：不请求 Discord，只刷新 cron_heartbeat 的时间，Pages 继续把这些频道当作"刚确认过"
+async function touchHeartbeat(env: Env): Promise<void> {
+  const row = await env.DB.prepare("SELECT payload FROM metadata WHERE name = 'cron_heartbeat'").first<{ payload: unknown }>();
+  let channels: string[] = [];
+  try {
+    channels = row ? JSON.parse(typeof row.payload === 'string' ? row.payload : new TextDecoder().decode(row.payload as ArrayBuffer)).channels || [] : [];
+  } catch (_) {}
+  await env.DB.prepare(
+    'INSERT INTO metadata (name, payload) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET payload = excluded.payload'
+  ).bind('cron_heartbeat', JSON.stringify({ at: Date.now(), channels, gateway: true })).run();
+}
+
+async function runMinute(env: Env, scheduledTime: number): Promise<void> {
+  if (env.REALTIME_GATEWAY === 'true' && env.GATEWAY && env.DISCORD_GUILD_ID) {
+    let status: any = null;
+    try {
+      status = await (await gatewayStub(env).fetch('https://gateway/ensure')).json(); // 看门狗：没连上就连
+    } catch (err: any) {
+      console.warn('[Gateway] 看门狗请求失败:', err.message || err);
+    }
+    const healthy = status?.state === 'ready' && Date.now() - Number(status.lastEventAt || 0) < GATEWAY_HEALTHY_MS;
+    if (healthy && Math.floor(scheduledTime / 60_000) % BACKSTOP_EVERY_MINUTES !== 0) {
+      await touchHeartbeat(env);
+      return;
+    }
+  }
+  await syncAllChannels(env);
 }
 
 let GUILD_OWNER_ID = '0';
-
-function getDomainProvider(url: string): { name: string; url?: string; color?: number } {
-  try {
-    const parsed = new URL(url);
-    const host = parsed.hostname.toLowerCase();
-    if (host.includes('youtube.com') || host.includes('youtu.be')) return { name: 'YouTube', url: 'https://www.youtube.com', color: 16711680 };
-    if (host.includes('twitter.com') || host.includes('x.com')) return { name: 'X (Twitter)', url: 'https://x.com', color: 1942002 };
-    if (host.includes('substack.com')) return { name: 'Substack', url: 'https://substack.com', color: 16736000 };
-    if (host.includes('zoom.us')) return { name: 'Zoom', url: 'https://zoom.us', color: 2969087 };
-    if (host.includes('drive.google.com')) return { name: 'Google Drive', url: 'https://drive.google.com', color: 4289797 };
-    if (host.includes('github.com')) return { name: 'GitHub', url: 'https://github.com', color: 2434341 };
-    if (host.includes('tenor.com')) return { name: 'Tenor', url: 'https://tenor.com' };
-    const cleanHost = host.replace(/^www\./, '');
-    const capitalized = cleanHost.charAt(0).toUpperCase() + cleanHost.slice(1);
-    return { name: capitalized, url: `${parsed.protocol}//${cleanHost}` };
-  } catch {
-    return { name: 'Link' };
-  }
-}
-
-export function normalizeDiscordEmbed(raw: any): any {
-  if (!raw) return null;
-  if (typeof raw === 'object' && !Array.isArray(raw) && raw.type && (raw.title || raw.description || raw.url || raw.image || raw.thumbnail)) {
-    return raw;
-  }
-
-  let title = '';
-  let description = '';
-  let url = '';
-  let footer = '';
-  let image = '';
-  let thumbnail = '';
-  let color: number | undefined = undefined;
-  let author: any = undefined;
-  let provider: any = undefined;
-
-  if (Array.isArray(raw)) {
-    title = String(raw[0] || '').trim();
-    description = String(raw[1] || '').trim();
-    url = String(raw[2] || '').trim();
-    footer = String(raw[3] || '').trim();
-  } else if (typeof raw === 'object') {
-    title = String(raw.title || '').trim();
-    description = String(raw.description || '').trim();
-    url = String(raw.url || '').trim();
-    footer = typeof raw.footer === 'string' ? raw.footer : String(raw.footer?.text || '').trim();
-    image = String(raw.image?.url || raw.image || '').trim();
-    thumbnail = String(raw.thumbnail?.url || raw.thumbnail || '').trim();
-    if (typeof raw.color === 'number') color = raw.color;
-    if (raw.author) author = raw.author;
-    if (raw.provider) provider = raw.provider;
-  }
-
-  if (!url && !title && !description && !image) return null;
-
-  let type = 'rich';
-  const lowerUrl = url.toLowerCase();
-  const domainInfo = url ? getDomainProvider(url) : null;
-  if (domainInfo) {
-    if (!provider) provider = { name: domainInfo.name, url: domainInfo.url };
-    if (color === undefined && domainInfo.color) color = domainInfo.color;
-  }
-
-  if (lowerUrl.includes('twitter.com') || lowerUrl.includes('x.com') || footer.toLowerCase() === 'x') {
-    type = 'rich';
-    color = 1942002;
-    provider = { name: 'X (Twitter)', url: 'https://x.com' };
-    if (!author) {
-      const authorMatch = url.match(/(?:twitter\.com|x\.com)\/([a-zA-Z0-9_]+)/i);
-      const handle = authorMatch ? authorMatch[1] : '';
-      if (handle && handle.toLowerCase() !== 'i' && handle.toLowerCase() !== 'status') {
-        author = { name: `@${handle}`, url: `https://x.com/${handle}` };
-      }
-    }
-    if (!footer) footer = 'X';
-  } else if (lowerUrl.includes('youtube.com') || lowerUrl.includes('youtu.be')) {
-    type = 'video';
-    const vMatch = url.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
-    if (vMatch && !thumbnail) thumbnail = `https://img.youtube.com/vi/${vMatch[1]}/hqdefault.jpg`;
-  } else if (lowerUrl.includes('tenor.com') || lowerUrl.includes('giphy.com')) {
-    type = 'gifv';
-    if (!title) {
-      const slugMatch = url.match(/\/view\/([^/?#]+)/i);
-      if (slugMatch) title = slugMatch[1].replace(/-gif-\d+$/, '').replace(/-\d+$/, '').replace(/-/g, ' ');
-    }
-  } else if (/\.(png|jpe?g|gif|webp|svg)($|\?)/i.test(url)) {
-    type = 'image';
-    if (!image) image = url;
-  }
-
-  const embed: any = { type, url: url || undefined };
-  if (title) embed.title = title;
-  if (description) embed.description = description;
-  if (color !== undefined) embed.color = color;
-  if (provider) embed.provider = provider;
-  if (author) embed.author = author;
-  if (footer) {
-    embed.footer = {
-      text: footer,
-      icon_url: footer.toLowerCase() === 'x' ? 'https://abs.twimg.com/responsive-web/client-web/icon-default.522d363a.png' : undefined
-    };
-  }
-  if (image) embed.image = { url: image, proxy_url: image, width: 600, height: 400 };
-  if (thumbnail) embed.thumbnail = { url: thumbnail, proxy_url: thumbnail, width: 400, height: 300 };
-
-  return embed;
-}
-
-function compareSnowflake(a: string, b: string): number {
-  if (!a || !b) return a ? 1 : b ? -1 : 0;
-  const x = BigInt(a);
-  const y = BigInt(b);
-  return x < y ? -1 : x > y ? 1 : 0;
-}
 
 const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
 const FETCH_LIMIT = 50;
@@ -210,48 +133,6 @@ async function discoverThreads(env: Env, listed: any[], headers: Record<string, 
   }
   console.log(`[CloudSync] #${parent.name} ${archived ? '已归档' : '活跃'}帖子 ${threads.length} 个`);
   return threads.map((t: any) => ({ id: String(t.id), name: String(t.name || ''), last_message_id: String(t.last_message_id) }));
-}
-
-function toRecord(raw: any, channelId: string) {
-  const authorId = raw.author?.id || '';
-  const authorName = raw.author?.global_name || raw.author?.username || '用户';
-  return {
-    id: String(raw.id),
-    channel_id: raw.channel_id || channelId,
-    author_id: authorId,
-    author: authorName,
-    username: raw.author?.username || authorName,
-    avatar: raw.author?.avatar ? `https://cdn.discordapp.com/avatars/${authorId}/${raw.author.avatar}.webp?size=64` : '',
-    content: raw.content || '',
-    created_at: raw.timestamp || new Date().toISOString(),
-    owner: authorId === GUILD_OWNER_ID,
-    // 转发（message_reference.type = 1）的内容在 message_snapshots，不能当成回复存
-    ...(isForward(raw) ? { snapshots: snapshotsFromDiscord(raw) } : {
-      reply_author: raw.referenced_message?.author?.global_name || raw.referenced_message?.author?.username,
-      reply_author_id: raw.referenced_message?.author?.id,
-      reply_content: raw.referenced_message?.content,
-      reply_channel_id: raw.message_reference?.channel_id,
-      reply_message_id: raw.message_reference?.message_id
-    }),
-    attachments: (raw.attachments || []).map((a: any) => ({
-      id: a.id ? String(a.id) : undefined,
-      filename: a.filename || '附件',
-      url: a.url || a.proxy_url || `/attachments/${raw.id}_${a.id}.bin`,
-      content_type: a.content_type || 'application/octet-stream',
-      size: a.size || 0,
-      width: a.width,
-      height: a.height
-    })),
-    embeds: (raw.embeds || []).map(normalizeDiscordEmbed).filter(Boolean),
-    stickers: (raw.sticker_items || []).map((st: any) => ({
-      id: String(st.id),
-      name: st.name || 'sticker',
-      format_type: Number(st.format_type) || 1,
-      url: `/stickers/${st.id}.${Number(st.format_type) === 3 ? 'json' : Number(st.format_type) === 4 ? 'gif' : 'png'}`
-    })),
-    message_type: Number(raw.type || 0),
-    remote: true
-  };
 }
 
 // 每分钟：先用 1 个请求拿到全部频道的 last_message_id，只拉真正有新消息的频道（之前每分钟固定连打 7 个频道）。
@@ -366,19 +247,9 @@ export async function syncAllChannels(env: Env): Promise<{
         upToDate.push(ch.id);
         return;
       }
-      const now = Date.now();
-      const records = batch.map((raw) => toRecord(raw, ch.id));
+      const records = batch.map((raw) => toRecord(raw, ch.id, GUILD_OWNER_ID));
       const maxId = records[records.length - 1].id;
-      await env.DB.batch([
-        ...records.map((r) => env.DB.prepare(
-          'INSERT INTO message_cache (channel, message_id, created_at, payload, inserted_at) VALUES (?, ?, ?, ?, ?) ' +
-          'ON CONFLICT(channel, message_id) DO UPDATE SET created_at = excluded.created_at, payload = excluded.payload'
-        ).bind(r.channel_id, r.id, r.created_at, new TextEncoder().encode(JSON.stringify(r)), now)),
-        env.DB.prepare(
-          'INSERT INTO sync_status (channel_id, last_refreshed_at, latest_message_id) VALUES (?, ?, ?) ' +
-          'ON CONFLICT(channel_id) DO UPDATE SET last_refreshed_at = excluded.last_refreshed_at, latest_message_id = MAX(sync_status.latest_message_id, excluded.latest_message_id)'
-        ).bind(ch.id, now, maxId)
-      ]);
+      await env.DB.batch(writeRecords(env.DB, ch.id, records));
       if (batch.length < FETCH_LIMIT) upToDate.push(ch.id);
       results.push({ id: ch.id, name: ch.name, count: records.length, max_id: maxId });
       console.log(`[CloudSync] 频道 #${ch.name} 写入 ${records.length} 条新消息 (最新 ID: ${maxId})`);
@@ -407,7 +278,7 @@ export async function syncAllChannels(env: Env): Promise<{
 export default {
   // 1. 每分钟自动由 Cloudflare Cron Trigger 触发 (100% 云端免维护)
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(syncAllChannels(env));
+    ctx.waitUntil(runMinute(env, event.scheduledTime));
   },
 
   // 2. HTTP：只读状态。手动触发入口已去掉（之前任何人访问 /sync 都会立刻连打 Discord）
@@ -421,9 +292,14 @@ export default {
       heartbeat = beat ? JSON.parse(typeof beat.payload === 'string' ? beat.payload : new TextDecoder().decode(beat.payload as ArrayBuffer)) : null;
     } catch (_) {}
 
+    let gateway: unknown = 'disabled';
+    if (env.REALTIME_GATEWAY === 'true' && env.GATEWAY) {
+      try { gateway = await (await gatewayStub(env).fetch('https://gateway/status')).json(); } catch (err: any) { gateway = { error: err.message }; }
+    }
     return Response.json({
       service: 'sync-worker',
       schedule: '*/1 * * * *',
+      gateway,
       heartbeat,
       discord_rate: await discordRateState(env),
       synced_channels: rows.results || []

@@ -9,7 +9,10 @@ const here = path.dirname(new URL(import.meta.url).pathname);
 const esbuild = path.join(here, '..', 'pages', 'node_modules', '.bin', 'esbuild');
 const out = fs.mkdtempSync('/tmp/guard-test-');
 execFileSync(esbuild, [path.join(here, '..', 'shared', 'discord-guard.ts'), '--bundle', '--format=esm', `--outfile=${out}/guard.mjs`]);
-execFileSync(esbuild, [path.join(here, '..', 'sync-worker', 'src', 'index.ts'), '--bundle', '--format=esm', `--outfile=${out}/sync.mjs`]);
+execFileSync(esbuild, [path.join(here, '..', 'sync-worker', 'src', 'index.ts'), '--bundle', '--format=esm', '--external:cloudflare:workers', `--outfile=${out}/sync.mjs`]);
+// the Workers runtime module is not available in Node: point it at a minimal DurableObject base class
+fs.writeFileSync(`${out}/cloudflare-workers.mjs`, 'export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }\n');
+fs.writeFileSync(`${out}/sync.mjs`, fs.readFileSync(`${out}/sync.mjs`, 'utf8').replace(/from\s*["']cloudflare:workers["']/g, `from "${out}/cloudflare-workers.mjs"`));
 
 function fakeD1() {
   const db = new DatabaseSync(':memory:');

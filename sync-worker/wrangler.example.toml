@@ -12,8 +12,18 @@ binding = "DB"
 database_name = "discord-archive-db"
 database_id = "<your D1 database id>"
 
+# Realtime sync (optional, REALTIME_GATEWAY = "true"): a Durable Object keeps a Discord gateway connection open
+[[durable_objects.bindings]]
+name = "GATEWAY"
+class_name = "DiscordGateway"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DiscordGateway"]
+
 [vars]
 DISCORD_GUILD_ID = "<your server id>"
+# REALTIME_GATEWAY = "true"   # see README "Realtime sync" (with a user token this is a self-bot)
 # GUILD_OWNER_ID = ""
 # PRIORITY_CHANNEL_IDS = "id1,id2"
 

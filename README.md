@@ -111,12 +111,34 @@ Pages project (`pages/wrangler.jsonc` vars, or dashboard; secrets with `wrangler
 | `LOCALE` / `COUNTRY_CODE` | | Client locale (default `en-US`) / country for billing-related stubs (default `US`) |
 | `DISCORD_TOKEN` (secret) | | Enables live sync on visit, Discord search and attachment re-signing |
 | `ORIGIN_URL` | | Optional origin for media files that are not in Pages or Discord's CDN |
+| `GATEWAY` (Durable Object binding) | | The sync Worker's `DiscordGateway`, for realtime pushes (see Realtime sync) |
 
 Sync Worker (`sync-worker/wrangler.toml`): `DISCORD_GUILD_ID`, secret `DISCORD_TOKEN`, optional `GUILD_OWNER_ID`,
-`PRIORITY_CHANNEL_IDS` (comma-separated channels synced first when more than 4 changed in one minute).
+`PRIORITY_CHANNEL_IDS` (comma-separated channels synced first when more than 4 changed in one minute),
+`REALTIME_GATEWAY` (`"true"` = Discord gateway connection, see below).
 
 `DISCORD_TOKEN` can be a bot token (`Bot <token>`) or a user token. Thread discovery uses `threads/search`, which only
 user tokens may call; with a bot token new threads are picked up by re-running the exporter.
+
+## Realtime sync · 实时同步
+
+By default the sync Worker polls Discord's REST API once a minute (new messages appear within ~30–90 s).
+With `REALTIME_GATEWAY = "true"` it instead keeps a **Discord gateway connection** open in a Durable Object
+(`sync-worker/src/gateway.ts`):
+
+- `MESSAGE_CREATE` / `MESSAGE_UPDATE` / `THREAD_*` for the server are written to D1 as they arrive and pushed to
+  visitors through the Pages gateway (bind `GATEWAY` in `pages/wrangler.jsonc`) — about 1 second end to end.
+- Disconnects resume the same session (missed events are replayed); new sessions are budgeted (≥ 2 min apart,
+  ≤ 40/day); an invalid token (close code 4004) pauses it for 30 minutes. Deleted messages are kept.
+- The cron becomes a watchdog: it (re)connects the gateway every minute and runs the REST sync only every 10 minutes
+  as a backstop, or every minute again while the gateway is down.
+- Free plan: one always-on Durable Object uses ~10,800 of the 13,000 GB-s included per day.
+- With a **bot token** the bot needs the Message Content intent and the gateway only receives what it subscribes to.
+  With a **user token** the connection receives events from every server the account is in, and running it 24/7 is a
+  self-bot: against Discord's Terms of Service, with a real risk of the account being restricted.
+
+实时同步：`REALTIME_GATEWAY = "true"` 时由 Durable Object 常驻连接 Discord 网关，新消息约 1 秒推给访客；
+定时任务改为看门狗 + 每 10 分钟 REST 补漏。用个人令牌属于 self-bot，违反 Discord 服务条款，有封号风险。
 
 ## Cloudflare free plan · 免费版注意事项
 

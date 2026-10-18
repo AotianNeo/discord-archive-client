@@ -7,6 +7,8 @@
   "compatibility_date": "2024-09-23",
   "compatibility_flags": ["nodejs_compat"],
   "pages_build_output_dir": "dist",
+  // Realtime sync: bind the sync worker's gateway object so new messages are pushed to visitors immediately
+  // "durable_objects": { "bindings": [ { "name": "GATEWAY", "class_name": "DiscordGateway", "script_name": "discord-archive-sync" } ] },
   "d1_databases": [
     { "binding": "DB", "database_name": "discord-archive-db", "database_id": "<your D1 database id>" }
   ],

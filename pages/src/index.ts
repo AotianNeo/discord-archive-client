@@ -22,6 +22,7 @@ export interface Env {
   COUNTRY_CODE?: string;      // 计费/地区相关端点返回的国家代码（默认 US）
   DISCORD_TOKEN?: string;     // 可选：用于实时同步、搜索、附件链接续签（secret）
   ORIGIN_URL?: string;        // 可选：本地/隧道媒体源，静态资源缺失时回源
+  GATEWAY?: DurableObjectNamespace; // 可选：sync-worker 的 DiscordGateway（REALTIME_GATEWAY），新消息实时推给访客
 }
 
 // 运行时配置：每个请求开始时由 configure(env) 写入（同一 Worker 的 env 不变）
@@ -2287,15 +2288,46 @@ function gatewaySender(server: WebSocket, request: Request): (text: string) => v
   };
 }
 
-function officialGateway(request: Request, env: Env): Response | null {
+function officialGateway(request: Request, env: Env, ctx: ExecutionContext): Response | null {
   if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return null;
   const pair = new WebSocketPair();
   const client = pair[0];
   const server = pair[1];
   server.accept();
   const send = gatewaySender(server, request);
+  const origin = new URL(request.url).origin;
   // 按入库时间推送：定时同步每分钟才写入，用消息自身的 created_at 比较会漏掉入库滞后的新消息
   let lastInsertedAt = Date.now();
+  // 已经推过的消息（实时推送和心跳轮询都会碰到同一条，只发一次）
+  const pushed = new Set<string>();
+  const push = (type: string, message: Message) => {
+    if (!message?.id || (type === 'MESSAGE_CREATE' && pushed.has(message.id))) return;
+    pushed.add(message.id);
+    if (pushed.size > 2000) pushed.delete(pushed.values().next().value as string);
+    send(JSON.stringify({ op: 0, t: type, d: archiveMessageToDiscord(message, origin) }));
+  };
+
+  // 实时：订阅 sync-worker 的 DiscordGateway（它连着 Discord 官方网关），收到新消息/编辑立刻推给这个访客
+  if (env.GATEWAY && GUILD_ID) {
+    ctx.waitUntil((async () => {
+      try {
+        const resp = await env.GATEWAY!.get(env.GATEWAY!.idFromName(GUILD_ID)).fetch('https://gateway/subscribe', { headers: { Upgrade: 'websocket' } });
+        const hub = resp.webSocket;
+        if (!hub) return;
+        hub.accept();
+        hub.addEventListener('message', (event) => {
+          try {
+            const { t, record } = JSON.parse(String(event.data));
+            if (t === 'MESSAGE_CREATE' || t === 'MESSAGE_UPDATE') push(t, record);
+          } catch (_) {}
+        });
+        server.addEventListener('close', () => { try { hub.close(1000, 'visitor left'); } catch (_) {} });
+        await new Promise((resolve) => { hub.addEventListener('close', resolve); server.addEventListener('close', resolve); });
+      } catch (err) {
+        console.warn('[Gateway] 订阅实时消息失败，退回心跳轮询:', err);
+      }
+    })());
+  }
 
   server.addEventListener('close', () => {
     connectedGateways.delete(server);
@@ -2329,14 +2361,7 @@ function officialGateway(request: Request, env: Env): Response | null {
           for (const row of rows.results || []) {
             lastInsertedAt = Math.max(lastInsertedAt, Number(row.inserted_at) || 0);
             try {
-              const msg = unpack(row.payload) as Message;
-              if (msg && msg.id) {
-                send(JSON.stringify({
-                  op: 0,
-                  t: 'MESSAGE_CREATE',
-                  d: archiveMessageToDiscord(msg)
-                }));
-              }
+              push('MESSAGE_CREATE', unpack(row.payload) as Message);
             } catch (_) {}
           }
         } catch (_) {}
@@ -3341,7 +3366,7 @@ export default {
       return new Response(null, { status: 204, headers });
     }
 
-    const gateway = (url.pathname === '/gateway' || url.pathname === '/gateway/') ? officialGateway(request, env) : null;
+    const gateway = (url.pathname === '/gateway' || url.pathname === '/gateway/') ? officialGateway(request, env, ctx) : null;
     if (gateway) return gateway;
 
     const wrapJson = (data: unknown, status = 200) => {
