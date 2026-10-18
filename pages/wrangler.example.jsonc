@@ -1,0 +1,23 @@
+// Copy to wrangler.jsonc and fill in. Secrets are not configured here:
+//   npx wrangler pages secret put ACCESS_PASSWORD --project-name <project>
+//   npx wrangler pages secret put DISCORD_TOKEN   --project-name <project>   (optional)
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "discord-archive",
+  "compatibility_date": "2024-09-23",
+  "compatibility_flags": ["nodejs_compat"],
+  "pages_build_output_dir": "dist",
+  "d1_databases": [
+    { "binding": "DB", "database_name": "discord-archive-db", "database_id": "<your D1 database id>" }
+  ],
+  "vars": {
+    "DISCORD_GUILD_ID": "<your server id>",
+    "GUILD_NAME": "My Server"
+    // "GUILD_ICON": "<icon hash>",
+    // "GUILD_OWNER_ID": "<owner user id>",
+    // "HOME_CHANNEL_ID": "<channel visitors land in>",
+    // "VISITOR_NAME": "Visitor",
+    // "LOCALE": "en-US",
+    // "PUBLIC_ACCESS": "true"            // only if the archive should be readable without a password
+  }
+}

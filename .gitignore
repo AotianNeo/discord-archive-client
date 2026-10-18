@@ -1,0 +1,21 @@
+node_modules
+dist/
+.wrangler/
+.dev.vars
+*.log
+.DS_Store
+__pycache__/
+
+# your configuration (copy from the *.example files)
+pages/wrangler.jsonc
+sync-worker/wrangler.toml
+
+# Discord's client build, downloaded by scripts/fetch-client.mjs (not redistributed)
+pages/public/assets/
+pages/public/official-shell.html
+pages/public/fetch-client-missing.txt
+
+# exported data and generated SQL
+export/
+demo-export/
+build/

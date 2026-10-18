@@ -1,0 +1,21 @@
+{
+  "name": "discord-archive-client-pages",
+  "private": true,
+  "scripts": {
+    "fetch-client": "node ../scripts/fetch-client.mjs --out public",
+    "build": "esbuild src/index.ts --bundle --format=esm --target=es2022 --outfile=dist/_worker.js --log-level=warning && node -e \"require('fs').cpSync('public','dist',{recursive:true})\"",
+    "dev": "wrangler pages dev dist --port 8787 --local-protocol https",
+    "deploy": "wrangler pages deploy dist",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "fzstd": "^0.1.1",
+    "pako": "^3.0.2"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240923.0",
+    "esbuild": "^0.23.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^4.0.0"
+  }
+}

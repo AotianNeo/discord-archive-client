@@ -1,0 +1,13 @@
+{
+  "name": "discord-archive-client-sync-worker",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240923.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^4.0.0"
+  }
+}

@@ -1,0 +1,20 @@
+# Copy to wrangler.toml and fill in. The D1 database is shared with the Pages project.
+name = "discord-archive-sync"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[triggers]
+crons = ["*/1 * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "discord-archive-db"
+database_id = "<your D1 database id>"
+
+[vars]
+DISCORD_GUILD_ID = "<your server id>"
+# GUILD_OWNER_ID = ""
+# PRIORITY_CHANNEL_IDS = "id1,id2"
+
+# Secret (not in this file):  npx wrangler secret put DISCORD_TOKEN
