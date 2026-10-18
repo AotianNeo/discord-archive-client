@@ -612,6 +612,19 @@ function canonicalAttachmentSource(value: unknown): string {
   }
 }
 
+// 本站代理地址（/attachments/cache/<描述符>）不含原始链接；按 Discord CDN 路径规则（频道/附件 id/文件名）还原
+function attachmentSourceOf(attachment: any): string {
+  const direct = canonicalAttachmentSource(attachment?.url);
+  if (direct || typeof attachment?.url !== 'string' || !attachment.url.startsWith(ATTACHMENT_PROXY_PREFIX) || !attachment.filename) return direct;
+  try {
+    const d = decodeAttachmentDescriptor(attachment.url.slice(ATTACHMENT_PROXY_PREFIX.length));
+    if (!/^\d{15,22}$/.test(d.channelId || '') || !/^\d{15,22}$/.test(d.attachmentId || '')) return '';
+    return `https://cdn.discordapp.com/attachments/${d.channelId}/${d.attachmentId}/${encodeURIComponent(attachment.filename)}`;
+  } catch {
+    return '';
+  }
+}
+
 // Discord 附件签名约 24 小时过期：批量换新签名（每次最多 50 个），结果写回 attachment_meta 供所有边缘节点复用
 async function refreshAttachmentUrls(env: Env, items: Array<{ id: string; source: string }>): Promise<Map<string, string>> {
   const fresh = new Map<string, string>();
@@ -722,7 +735,7 @@ async function hydrateAttachments(env: Env, messages: Message[]): Promise<Messag
       }
     }
     const first = list[0];
-    const source = meta?.source || canonicalAttachmentSource(first.url);
+    const source = meta?.source || attachmentSourceOf(first);
     if (!source) continue;
     if (!meta) {
       inserts.push(env.DB.prepare(
@@ -2702,19 +2715,20 @@ async function discordAttachmentSourceFromDescriptor(parsed: AttachmentDescripto
       'User-Agent': 'Discord-Archive-Client/1.0',
       Accept: 'application/json'
     };
-    const exactResp = await discordFetch(
+    // 读取单条消息只对机器人开放：个人令牌调用得到 403，还会让限频器把整个频道的消息接口停 10 分钟（同步也一起停）
+    const exactResp = /^Bot\s/i.test(env.DISCORD_TOKEN) ? await discordFetch(
       env,
       `https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(messageId)}`,
       { headers }
-    );
-    let data: any = exactResp.ok ? await exactResp.json() : null;
+    ) : null;
+    let data: any = exactResp?.ok ? await exactResp.json() : null;
     if (!data) {
       const aroundUrl = new URL(`https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages`);
       aroundUrl.searchParams.set('around', messageId);
       aroundUrl.searchParams.set('limit', '100');
       const aroundResp = await discordFetch(env, aroundUrl.toString(), { headers });
       if (!aroundResp.ok) {
-        console.warn(`[Media] Discord 附件消息查询失败: exact=${exactResp.status}, around=${aroundResp.status}`);
+        console.warn(`[Media] Discord 附件消息查询失败: exact=${exactResp?.status ?? 'skipped'}, around=${aroundResp.status}`);
         return '';
       }
       const around = await aroundResp.json();
@@ -3095,10 +3109,8 @@ async function syncChannelMessages(
   }
 
   // 按时间升序排列
+  // 按原始 CDN 地址入库（输出时 archiveMessageToDiscord 才换成本站代理地址）；先换再存会丢掉原始链接，签名过期后无法续签
   newMessages.sort((a, b) => (a.id < b.id ? -1 : 1));
-  for (let i = 0; i < newMessages.length; i++) {
-    newMessages[i] = localizeMessage(newMessages[i]);
-  }
 
   // 4. 若有新消息，原子化追加写入 D1
   if (newMessages.length > 0) {
