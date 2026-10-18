@@ -9,6 +9,7 @@
   "pages_build_output_dir": "dist",
   // Realtime sync: bind the sync worker's gateway object so new messages are pushed to visitors immediately
   // "durable_objects": { "bindings": [ { "name": "GATEWAY", "class_name": "DiscordGateway", "script_name": "discord-archive-sync" } ] },
+  // Permanent media cache (optional): "r2_buckets": [ { "binding": "MEDIA", "bucket_name": "discord-archive-media" } ],
   "d1_databases": [
     { "binding": "DB", "database_name": "discord-archive-db", "database_id": "<your D1 database id>" }
   ],
@@ -20,6 +21,7 @@
     // "HOME_CHANNEL_ID": "<channel visitors land in>",
     // "VISITOR_NAME": "Visitor",
     // "LOCALE": "en-US",
-    // "PUBLIC_ACCESS": "true"            // only if the archive should be readable without a password
+    // "PUBLIC_ACCESS": "true",           // only if the archive should be readable without a password
+    // "MEDIA_CACHE": "off"               // no-cache mode: stream media from Discord on every request, store nothing
   }
 }

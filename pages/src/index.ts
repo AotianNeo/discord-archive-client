@@ -23,6 +23,7 @@ export interface Env {
   DISCORD_TOKEN?: string;     // 可选：用于实时同步、搜索、附件链接续签（secret）
   ORIGIN_URL?: string;        // 可选：本地/隧道媒体源，静态资源缺失时回源
   GATEWAY?: DurableObjectNamespace; // 可选：sync-worker 的 DiscordGateway（REALTIME_GATEWAY），新消息实时推给访客
+  MEDIA_CACHE?: string;       // "off" = 无缓存模式：附件/头像等不读写边缘缓存和 R2，每次实时从 Discord 取（默认缓存）
 }
 
 // 运行时配置：每个请求开始时由 configure(env) 写入（同一 Worker 的 env 不变）
@@ -3504,7 +3505,10 @@ export default {
         return new Response('附件 URL 已失效，请刷新页面获取最新 URL', { status: 410, headers: applySecurityHeaders(new Headers()) });
       }
       const range = request.method === 'GET' ? request.headers.get('Range') : '';
-      const cacheable = !range;
+      // 无缓存模式：不读也不写边缘缓存和 R2，浏览器也不保存；每次请求都用当前有效的签名链接从 Discord 实时取
+      // （签名链接本身在 attachment_meta 里复用到过期前，避免每次都调 refresh-urls）。部署包里的静态文件照常直接返回
+      const noCache = (env.MEDIA_CACHE || '').trim().toLowerCase() === 'off';
+      const cacheable = !range && !noCache;
       const cache = caches.default;
       const cacheKey = mediaCacheKey(request.url, proxySource, proxyLocalPath || safeLocalMediaPath(url.pathname));
       const mediaKey = `${MEDIA_CACHE_VERSION}/${new URL(cacheKey.url).pathname.replace(/^\/+/, '')}`;
@@ -3519,15 +3523,19 @@ export default {
         const status = originResp.status;
         const length = Number(originResp.headers.get('content-length') || '');
         const headers = mediaHeaders(originResp.headers, Number.isFinite(length) && length >= 0 ? length : undefined);
-        headers.set('X-Media-Cache', source);
+        headers.set('X-Media-Cache', noCache ? `${source}; NO-CACHE` : source);
+        if (noCache) headers.set('Cache-Control', 'no-store');
         if (fromLocalOrigin) headers.set('X-Origin-Fallback', 'HIT-ORIGIN');
         if (refreshedByDiscord) headers.set('X-Media-Refresh', 'DISCORD-API');
         if (cacheable && status === 200) {
+          // 两份副本必须在把 body 交给访客之前克隆好；在 waitUntil 里再 clone 时 body 已经在流式输出，R2 写入会失败
           const copy = originResp.clone();
+          const persistent = env.MEDIA ? originResp.clone() : null;
           ctx.waitUntil((async () => {
             await cache.put(cacheKey, new Response(copy.body, { status: 200, headers }));
-            if (env.MEDIA) {
-              await env.MEDIA.put(mediaKey, originResp.clone().body, {
+            if (env.MEDIA && persistent) {
+              // 首次访问后永久保存到 R2：之后任何机房都直接读 R2，不再找 Discord 换链接
+              await env.MEDIA.put(mediaKey, persistent.body, {
                 httpMetadata: {
                   contentType: originResp.headers.get('content-type') || 'application/octet-stream',
                   contentDisposition: originResp.headers.get('content-disposition') || undefined
