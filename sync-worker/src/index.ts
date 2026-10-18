@@ -43,6 +43,14 @@ async function runMinute(env: Env, scheduledTime: number): Promise<void> {
       console.warn('[Gateway] 看门狗请求失败:', err.message || err);
     }
     const healthy = status?.state === 'ready' && Date.now() - Number(status.lastEventAt || 0) < GATEWAY_HEALTHY_MS;
+    // 网关状态写进 D1：Workers 请求额度用完时 HTTP 状态页打不开，也能从 metadata.gateway_status 查
+    if (status) {
+      console.log(`[Gateway] ${status.state} messages=${status.messages} reconnects=${status.reconnects} subscribers=${status.subscribers} ` +
+        `identifies24h=${status.identifies24h}${status.lastClose ? ` last_close="${status.lastClose}"` : ''}`);
+      await env.DB.prepare(
+        "INSERT INTO metadata (name, payload) VALUES ('gateway_status', ?) ON CONFLICT(name) DO UPDATE SET payload = excluded.payload"
+      ).bind(JSON.stringify({ ...status, checkedAt: Date.now() })).run();
+    }
     if (healthy && Math.floor(scheduledTime / 60_000) % BACKSTOP_EVERY_MINUTES !== 0) {
       await touchHeartbeat(env);
       return;

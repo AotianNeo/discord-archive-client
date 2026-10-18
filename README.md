@@ -135,12 +135,16 @@ With `REALTIME_GATEWAY = "true"` it instead keeps a **Discord gateway connection
 - The cron becomes a watchdog: it (re)connects the gateway every minute and runs the REST sync only every 10 minutes
   as a backstop, or every minute again while the gateway is down.
 - Free plan: one always-on Durable Object uses ~10,800 of the 13,000 GB-s included per day.
-- With a **bot token** the bot needs the Message Content intent and the gateway only receives what it subscribes to.
-  With a **user token** the connection receives events from every server the account is in, and running it 24/7 is a
-  self-bot: against Discord's Terms of Service, with a real risk of the account being restricted.
+- **Use a bot token.** In testing, Discord closed every user-token IDENTIFY coming from Cloudflare's network with
+  `4000 Unknown error` (the same code and payload worked from a residential connection, ~0.2 s delivery). After three
+  rejected IDENTIFYs in a row the gateway pauses for 6 hours; the cron keeps polling REST every minute meanwhile.
+- A bot needs the Message Content intent; the gateway then only receives what it subscribes to. A user token would
+  receive events from every server the account is in, and running it 24/7 is a self-bot: against Discord's Terms of
+  Service, with a real risk of the account being restricted.
 
 实时同步：`REALTIME_GATEWAY = "true"` 时由 Durable Object 常驻连接 Discord 网关，新消息约 1 秒推给访客；
-定时任务改为看门狗 + 每 10 分钟 REST 补漏。用个人令牌属于 self-bot，违反 Discord 服务条款，有封号风险。
+定时任务改为看门狗 + 每 10 分钟 REST 补漏。请使用机器人令牌：实测个人令牌从 Cloudflare 机房登录网关会被 Discord 以 4000 拒绝
+（连续 3 次后暂停 6 小时，期间照常每分钟 REST 轮询）；个人令牌挂网关也属于 self-bot，违反服务条款。
 
 ## Cloudflare free plan · 免费版注意事项
 

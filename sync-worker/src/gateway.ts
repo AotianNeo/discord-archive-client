@@ -14,6 +14,7 @@ export interface GatewayEnv {
   DISCORD_GUILD_ID: string;
   GUILD_OWNER_ID?: string;
   REALTIME_GATEWAY?: string;
+  GATEWAY_CLIENT_BUILD?: string; // 用户令牌 IDENTIFY 里的 client_build_number（默认 641004，与 fetch-client 下载的网页版一致即可）
   GATEWAY: DurableObjectNamespace;
 }
 
@@ -23,6 +24,7 @@ const SILENCE_LIMIT_MS = 3 * 60_000;     // 这么久一个事件（含心跳 AC
 const IDENTIFY_MIN_GAP_MS = 120_000;
 const IDENTIFY_PER_DAY = 40;
 const AUTH_FAILED_PAUSE_MS = 30 * 60_000;
+const IDENTIFY_REJECTED_PAUSE_MS = 6 * 3600_000;
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
 // 机器人：GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT（特权 intent，需在开发者后台开启）
 const BOT_INTENTS = (1 << 0) | (1 << 9) | (1 << 15);
@@ -43,15 +45,19 @@ export interface GatewayStatus {
   reconnects: number;
   lastClose: string;
   subscribers: number;
+  identifies24h: number;
+  lastIdentifyAt: number;
+  pausedUntil: number;
 }
 
 export class DiscordGateway extends DurableObject<GatewayEnv> {
   private ws: WebSocket | null = null;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private acked = true;
+  private identifySentAt = 0;
   private session: Session = { seq: null };
   private connecting: Promise<void> | null = null;
-  private status: Omit<GatewayStatus, 'subscribers'> = {
+  private status: Omit<GatewayStatus, 'subscribers' | 'identifies24h' | 'lastIdentifyAt' | 'pausedUntil'> = {
     state: 'idle', connectedAt: 0, readyAt: 0, lastEventAt: 0, lastMessageAt: 0, messages: 0, reconnects: 0, lastClose: ''
   };
 
@@ -72,7 +78,7 @@ export class DiscordGateway extends DurableObject<GatewayEnv> {
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
     if (url.pathname === '/ensure') await this.ensure();
-    return Response.json(this.publicStatus());
+    return Response.json(await this.publicStatus());
   }
 
   async alarm(): Promise<void> {
@@ -86,8 +92,17 @@ export class DiscordGateway extends DurableObject<GatewayEnv> {
     try { ws.close(code === 1005 ? 1000 : code, 'bye'); } catch (_) {}
   }
 
-  private publicStatus(): GatewayStatus {
-    return { ...this.status, subscribers: this.ctx.getWebSockets().length };
+  private async publicStatus(): Promise<GatewayStatus> {
+    const now = Date.now();
+    const log = ((await this.ctx.storage.get<number[]>('identifies')) || []).filter((t) => now - t < 86_400_000);
+    return {
+      ...this.status,
+      lastClose: this.status.lastClose || (await this.ctx.storage.get<string>('lastClose')) || '',
+      subscribers: this.ctx.getWebSockets().length,
+      identifies24h: log.length,
+      lastIdentifyAt: log[log.length - 1] || 0,
+      pausedUntil: (await this.ctx.storage.get<number>('pausedUntil')) || 0
+    };
   }
 
   private async ensure(): Promise<void> {
@@ -99,7 +114,7 @@ export class DiscordGateway extends DurableObject<GatewayEnv> {
     }
     const pausedUntil = (await this.ctx.storage.get<number>('pausedUntil')) || 0;
     if (pausedUntil > Date.now()) {
-      this.status.state = 'auth-failed';
+      this.status.state = 'paused';
       return;
     }
     if (this.ws && Date.now() - this.status.lastEventAt > SILENCE_LIMIT_MS) this.reconnect('silent connection');
@@ -135,11 +150,12 @@ export class DiscordGateway extends DurableObject<GatewayEnv> {
     const isBot = this.env.DISCORD_TOKEN.toLowerCase().startsWith('bot ');
     const headers: Record<string, string> = { Upgrade: 'websocket' };
     if (!isBot) Object.assign(headers, { 'User-Agent': UA, Origin: 'https://discord.com' });
-    const resp = await fetch(`${base}/?v=10&encoding=json`, { headers });
+    const resp = await fetch(`${base}/?v=${isBot ? 10 : 9}&encoding=json`, { headers });
     const ws = resp.webSocket;
     if (!ws) throw new Error(`gateway handshake failed: ${resp.status}`);
     ws.accept();
     this.ws = ws;
+    console.log(`[Gateway] ${resume ? 'resuming' : 'identifying'} via ${base}`);
     this.status.state = resume ? 'resuming' : 'connecting';
     this.status.connectedAt = this.status.lastEventAt = Date.now();
     ws.addEventListener('message', (ev) => { this.onMessage(ws, ev.data, resume).catch((err) => console.warn('[Gateway] 事件处理失败:', err)); });
@@ -156,19 +172,19 @@ export class DiscordGateway extends DurableObject<GatewayEnv> {
     if (token.toLowerCase().startsWith('bot ')) {
       return { op: 2, d: { token: token.slice(4).trim(), intents: BOT_INTENTS, properties: { os: 'linux', browser: 'discord-archive-client', device: 'discord-archive-client' } } };
     }
+    // 与官方网页客户端发的 IDENTIFY 一致（从机房 IP 连接时，字段不全会被直接 4000 关闭）
     return {
       op: 2,
       d: {
         token,
-        capabilities: 0,
+        capabilities: 1767421,
         properties: {
-          os: 'Mac OS X', browser: 'Chrome', device: '', system_locale: 'en-US', browser_user_agent: UA, browser_version: '140.0.0.0',
-          os_version: '10.15.7', referrer: '', referring_domain: '', referrer_current: '', referring_domain_current: '',
-          release_channel: 'stable', client_event_source: null
+          os: 'Mac OS X', browser: 'Chrome', device: '', device_model_name: '', system_locale: 'en-US', has_client_mods: false,
+          browser_user_agent: UA, browser_version: '140.0.0.0', os_version: '10.15.7',
+          referrer: '', referring_domain: '', referrer_current: '', referring_domain_current: '',
+          release_channel: 'stable', client_build_number: Number(this.env.GATEWAY_CLIENT_BUILD || 641004),
+          client_event_source: null, client_launch_id: crypto.randomUUID(), is_fast_connect: false
         },
-        // status 'unknown' = 沿用账号自己的在线状态，这个会话不改变别人看到的状态
-        presence: { status: 'unknown', since: 0, activities: [], afk: false },
-        compress: false,
         client_state: { guild_versions: {} }
       }
     };
@@ -186,6 +202,7 @@ export class DiscordGateway extends DurableObject<GatewayEnv> {
           this.send(ws, { op: 6, d: { token: this.env.DISCORD_TOKEN.replace(/^bot\s+/i, ''), session_id: this.session.sessionId, seq: this.session.seq } });
         } else {
           await this.recordIdentify();
+          this.identifySentAt = Date.now();
           this.send(ws, this.identifyPayload());
         }
         break;
@@ -230,6 +247,9 @@ export class DiscordGateway extends DurableObject<GatewayEnv> {
         await this.ctx.storage.put('session', this.session);
         this.status.state = 'ready';
         this.status.readyAt = Date.now();
+        this.identifySentAt = 0;
+        await this.ctx.storage.put('identifyRejections', 0);
+        console.log('[Gateway] READY');
         if (!this.env.DISCORD_TOKEN.toLowerCase().startsWith('bot ')) {
           // 和官方客户端打开服务器时一样订阅本服务器的子区事件（不要打字、在线状态等）
           this.send(this.ws!, { op: 37, d: { subscriptions: { [guildId]: { typing: false, threads: true, activities: false, member_updates: false } } } });
@@ -288,12 +308,28 @@ export class DiscordGateway extends DurableObject<GatewayEnv> {
   private onClose(ws: WebSocket, code: number, reason: string): void {
     if (ws !== this.ws) return;
     this.disconnect(`${code} ${reason}`.trim());
-    this.status.lastClose = `${code} ${reason}`.trim();
+    this.status.lastClose = `${new Date().toISOString()} ${code} ${reason}`.trim();
+    console.warn(`[Gateway] closed: ${code} ${reason}`);
+    this.ctx.storage.put('lastClose', this.status.lastClose);
     if (code === 4004) {
       // 令牌被拒：停 30 分钟，避免反复用失效令牌 IDENTIFY
       this.status.state = 'auth-failed';
       this.ctx.storage.put('pausedUntil', Date.now() + AUTH_FAILED_PAUSE_MS);
       return;
+    }
+    // IDENTIFY 后几秒内就被关（未收到 READY）：Discord 拒绝了这个登录。实测个人令牌从 Cloudflare 机房连接会被 4000 拒绝，
+    // 而从住宅网络正常。连续 3 次就暂停 6 小时，不要反复尝试（每次被拒都是一次可疑登录）
+    if (this.identifySentAt && Date.now() - this.identifySentAt < 15_000) {
+      this.identifySentAt = 0;
+      this.ctx.storage.get<number>('identifyRejections').then(async (n) => {
+        const count = (n || 0) + 1;
+        await this.ctx.storage.put('identifyRejections', count);
+        if (count >= 3) {
+          await this.ctx.storage.put('pausedUntil', Date.now() + IDENTIFY_REJECTED_PAUSE_MS);
+          await this.ctx.storage.put('identifyRejections', 0);
+          console.warn(`[Gateway] IDENTIFY rejected ${count} times in a row (${code}); pausing for 6 hours`);
+        }
+      });
     }
     if ([4010, 4011, 4012, 4013, 4014].includes(code)) {
       this.status.state = `fatal ${code}`;
