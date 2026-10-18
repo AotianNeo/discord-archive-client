@@ -22,6 +22,6 @@
     // "VISITOR_NAME": "Visitor",
     // "LOCALE": "en-US",
     // "PUBLIC_ACCESS": "true",           // only if the archive should be readable without a password
-    // "MEDIA_CACHE": "off"               // no-cache mode: stream media from Discord on every request, store nothing
+    // "MEDIA_CACHE": "off"               // no-cache mode: the server stores no media; only visitors' browsers cache it
   }
 }

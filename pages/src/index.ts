@@ -23,7 +23,7 @@ export interface Env {
   DISCORD_TOKEN?: string;     // 可选：用于实时同步、搜索、附件链接续签（secret）
   ORIGIN_URL?: string;        // 可选：本地/隧道媒体源，静态资源缺失时回源
   GATEWAY?: DurableObjectNamespace; // 可选：sync-worker 的 DiscordGateway（REALTIME_GATEWAY），新消息实时推给访客
-  MEDIA_CACHE?: string;       // "off" = 无缓存模式：附件/头像等不读写边缘缓存和 R2，每次实时从 Discord 取（默认缓存）
+  MEDIA_CACHE?: string;       // "off" = 无缓存模式：服务端不读写边缘缓存和 R2，每次实时从 Discord 取；只由访客浏览器缓存（默认服务端缓存）
 }
 
 // 运行时配置：每个请求开始时由 configure(env) 写入（同一 Worker 的 env 不变）
@@ -3505,7 +3505,7 @@ export default {
         return new Response('附件 URL 已失效，请刷新页面获取最新 URL', { status: 410, headers: applySecurityHeaders(new Headers()) });
       }
       const range = request.method === 'GET' ? request.headers.get('Range') : '';
-      // 无缓存模式：不读也不写边缘缓存和 R2，浏览器也不保存；每次请求都用当前有效的签名链接从 Discord 实时取
+      // 无缓存模式：服务端不读也不写边缘缓存和 R2，只让访客浏览器缓存；浏览器没有的就用当前有效的签名链接从 Discord 实时取
       // （签名链接本身在 attachment_meta 里复用到过期前，避免每次都调 refresh-urls）。部署包里的静态文件照常直接返回
       const noCache = (env.MEDIA_CACHE || '').trim().toLowerCase() === 'off';
       const cacheable = !range && !noCache;
@@ -3524,7 +3524,9 @@ export default {
         const length = Number(originResp.headers.get('content-length') || '');
         const headers = mediaHeaders(originResp.headers, Number.isFinite(length) && length >= 0 ? length : undefined);
         headers.set('X-Media-Cache', noCache ? `${source}; NO-CACHE` : source);
-        if (noCache) headers.set('Cache-Control', 'no-store');
+        // 服务端不留副本，但图片保存在访客自己的浏览器里：URL 里带附件 ID（头像带哈希），内容不会变，可以一直用；
+        // private = 只允许浏览器缓存，Cloudflare 等共享缓存不能存
+        if (noCache) headers.set('Cache-Control', 'private, max-age=31536000, immutable');
         if (fromLocalOrigin) headers.set('X-Origin-Fallback', 'HIT-ORIGIN');
         if (refreshedByDiscord) headers.set('X-Media-Refresh', 'DISCORD-API');
         if (cacheable && status === 200) {

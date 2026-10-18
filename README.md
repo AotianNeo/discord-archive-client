@@ -113,7 +113,7 @@ Pages project (`pages/wrangler.jsonc` vars, or dashboard; secrets with `wrangler
 | `ORIGIN_URL` | | Optional origin for media files that are not in Pages or Discord's CDN |
 | `GATEWAY` (Durable Object binding) | | The sync Worker's `DiscordGateway`, for realtime pushes (see Realtime sync) |
 | `MEDIA` (R2 binding) | | Permanent media store: the first request for an attachment/avatar downloads it (with a freshly signed Discord link) and keeps it in R2; afterwards every data center serves it from R2 |
-| `MEDIA_CACHE` | | `off` = no-cache mode: media is never stored (no edge cache, no R2, `Cache-Control: no-store`); every request streams it from Discord with a currently valid signed link. Default: cache on first access |
+| `MEDIA_CACHE` | | `off` = no-cache mode: the server never stores media (no edge cache, no R2); a request streams it from Discord with a currently valid signed link, and only the visitor's browser keeps it (`Cache-Control: private, immutable`). Default: cache on first access |
 
 Sync Worker (`sync-worker/wrangler.toml`): `DISCORD_GUILD_ID`, secret `DISCORD_TOKEN`, optional `GUILD_OWNER_ID`,
 `PRIORITY_CHANNEL_IDS` (comma-separated channels synced first when more than 4 changed in one minute),
