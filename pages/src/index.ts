@@ -1539,9 +1539,39 @@ function withDismissedContents(settings: string, ids: number[]): string {
   return concatSettings(settings, btoa(String.fromCharCode(0x22, ...protoLen(inner.length), ...inner)));
 }
 
+// 字节拼接 = protobuf 合并，重复字段会被追加。guild_folders(14) 里是服务器列表：客户端每次改动都发整份，
+// 拼接后同一个服务器出现多次，新版客户端建服务器树时报 "[GUILDS TREE] Tried adding a node that already exists" 并不停重连。
+// 这类字段按"后出现的整份替换前面的"处理，读和写都只保留最后一份（也修复已经存进 D1 的重复数据）
+const REPLACE_ON_PATCH_FIELDS: Record<number, number[]> = { 1: [14] };
+
+function keepLastTopLevel(settings: string, fields: number[]): string {
+  if (!settings || !fields.length) return settings;
+  const bytes = Uint8Array.from(atob(settings), (c) => c.charCodeAt(0));
+  const spans: Array<[number, number, number]> = []; // [field, start, end]
+  let pos = 0;
+  while (pos < bytes.length) {
+    const start = pos;
+    const [key, p] = protoVarint(bytes, pos);
+    const wire = key & 7;
+    if (wire === 0) pos = protoVarint(bytes, p)[1];
+    else if (wire === 1) pos = p + 8;
+    else if (wire === 5) pos = p + 4;
+    else if (wire === 2) { const [len, s0] = protoVarint(bytes, p); pos = s0 + len; }
+    else throw new Error(`unsupported wire type ${wire}`);
+    spans.push([key >>> 3, start, pos]);
+  }
+  const last = new Map<number, number>();
+  spans.forEach(([field], i) => { if (fields.includes(field)) last.set(field, i); });
+  const kept = spans.filter(([field], i) => !fields.includes(field) || last.get(field) === i);
+  if (kept.length === spans.length) return settings;
+  const out: number[] = [];
+  for (const [, start, end] of kept) for (let i = start; i < end; i++) out.push(bytes[i]);
+  return btoa(String.fromCharCode(...out));
+}
+
 function withDefaultSettings(type: number, stored: string): string {
   try {
-    const merged = concatSettings(DEFAULT_USER_SETTINGS[type] || '', stored);
+    const merged = keepLastTopLevel(concatSettings(DEFAULT_USER_SETTINGS[type] || '', stored), REPLACE_ON_PATCH_FIELDS[type] || []);
     return type === 1 ? withDismissedContents(merged, DEFAULT_DISMISSED_CONTENTS) : merged;
   } catch (_) {
     return stored;
@@ -1566,7 +1596,7 @@ async function patchUserSettings(env: Env, type: number, patch: string): Promise
   if (!patch) return withDefaultSettings(type, current);
   let merged = patch;
   try {
-    const joined = concatSettings(current, patch);
+    const joined = keepLastTopLevel(concatSettings(current, patch), REPLACE_ON_PATCH_FIELDS[type] || []);
     // 重复字段会随拼接增长；超过 16 KB 时只保留本次补丁
     if (joined.length <= 21_848) merged = joined;
   } catch (_) {
@@ -1747,7 +1777,9 @@ const OFFICIAL_STUBS: Array<[method: string, pattern: RegExp, body: StubBody, st
   // 更新日志配置（cdn.discordapp.com/changelogs，official-shell.html 改写过来）：空配置 = 不弹"新功能"
   ['GET', /^\/changelogs\/config_\d+\.json$/, {}],
   ['GET', /^\/soundboard-default-sounds$/, []],
-  ['POST', /^\/beaker$/, null, 204]
+  ['POST', /^\/beaker$/, null, 204],
+  // 新版客户端请服务端挑选要展示的引导/推广（coachmark）；空列表 = 只显示客户端自己的，不弹推广
+  ['POST', /^\/dismissible-content\/arbitrate$/, { candidates: [] }]
 ];
 
 async function officialStub(path: string, url: URL, request?: Request): Promise<OfficialResult | null> {
