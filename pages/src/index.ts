@@ -2,7 +2,7 @@ import { decompress } from 'fzstd';
 import { Deflate } from 'pako';
 import { discordFetch } from '../../shared/discord-guard';
 import { ArchiveSnapshot, MESSAGE_REFERENCE_FORWARD, isForward, snapshotsFromDiscord } from '../../shared/message-snapshots';
-import { GUILD_ROLES_KEY, ensureMemberTable } from '../../shared/members';
+import { GUILD_ROLES_KEY } from '../../shared/roles';
 import guildExperiments from './experiments/guild_experiments.json';
 import userExperiments from './experiments/user_experiments.json';
 import apexExperiments from './experiments/apex_experiments.json';
@@ -47,9 +47,9 @@ function configure(env: Env): void {
 }
 
 // Discord CDN 上不需要签名的公开图片，直接回源 cdn.discordapp.com：头像、表情、贴纸、服务器图标，
-// 以及成员资料用到的服务器内头像/横幅（/guilds/:id/users/:id/...）、用户横幅、身份组图标、徽章、头像装饰、服务器标签徽章
+// 以及服务器成员用到的服务器内头像/横幅（/guilds/:id/users/:id/...）、用户横幅、身份组图标、头像装饰、服务器标签徽章
 const CDN_IMAGE_PREFIXES = ['/avatars/', '/emojis/', '/icons/', '/stickers/', '/guilds/', '/banners/', '/role-icons/',
-  '/badge-icons/', '/avatar-decoration-presets/', '/clan-badges/', '/guild-tag-badges/'];
+  '/avatar-decoration-presets/', '/clan-badges/', '/guild-tag-badges/'];
 
 const MEDIA_RESET_COOKIE = 'media_reset';
 const MEDIA_RESET_VERSION = '20261018-avatar-size';
@@ -1112,8 +1112,7 @@ function userMetaToDiscord(meta: UserMeta): any {
   };
 }
 
-// 成员资料（sync-worker 的 members.ts 写入 member_meta）：身份组、服务器内昵称/头像/横幅、服务器资料（简介、代词）。
-// 结果只含已经拉到的；没拉过的（包括访客要过、还在排队的）不在里面
+// 服务器成员（scripts/backfill_members.mjs 用网关批量写入 member_meta）：身份组、服务器内昵称和头像。没有的人不在结果里
 interface StoredMember { in_guild: number; profile: any }
 
 async function readMemberProfiles(env: Env, ids: string[]): Promise<Map<string, StoredMember>> {
@@ -1134,23 +1133,7 @@ async function readMemberProfiles(env: Env, ids: string[]): Promise<Map<string, 
   return out;
 }
 
-// 访客的客户端要了、库里还没有的成员：记下来，sync-worker 下一轮优先拉
-async function wantMembers(env: Env, ids: string[]): Promise<void> {
-  const wanted = ids.filter((id) => id !== VISITOR_USER_ID).slice(0, 100);
-  if (!wanted.length) return;
-  try {
-    await ensureMemberTable(env.DB);
-    const now = Date.now();
-    await env.DB.batch(wanted.map((id) => env.DB.prepare(
-      'INSERT INTO member_meta (user_id, wanted_at, due_at) VALUES (?, ?, 0) ' +
-      'ON CONFLICT(user_id) DO UPDATE SET wanted_at = excluded.wanted_at, due_at = 0 WHERE member_meta.fetched_at = 0'
-    ).bind(id, now)));
-  } catch (err) {
-    console.warn('[Members] 记录待拉成员失败:', err);
-  }
-}
-
-// 网关里的成员对象（GUILD_MEMBERS_CHUNK / GUILD_MEMBER_UPDATE）；不在服务器里的返回 null
+// 网关里的成员对象（GUILD_MEMBERS_CHUNK、成员列表）；不在服务器里的返回 null
 function memberWithUser(stored: StoredMember | undefined, fallbackUser?: any): any | null {
   if (!stored?.in_guild || !stored.profile?.guild_member) return null;
   return { ...stored.profile.guild_member, user: { ...(fallbackUser || {}), ...(stored.profile.user || {}) } };
@@ -1235,10 +1218,8 @@ async function userProfileBody(env: Env, userId: string, guildId: string): Promi
   const [meta, members] = await Promise.all([readUserMeta(env, userId), readMemberProfiles(env, [userId])]);
   const stored = members.get(userId);
   if (!meta && !stored?.profile?.user) return { status: 404, body: { message: 'Unknown User', code: 10013 } };
-  if (!stored) await wantMembers(env, [userId]); // 还没拉过：排到下一轮
-  const synced = stored?.profile || {};
-  // 资料接口拿到的用户对象更新（当前头像、显示名样式、服务器标签），归档里的作为兜底
-  const user = { ...(meta ? userMetaToDiscord(meta) : {}), ...(synced.user || {}) };
+  // 成员接口拿到的用户对象更新（当前头像、显示名样式、服务器标签），归档里的作为兜底
+  const user = { ...(meta ? userMetaToDiscord(meta) : {}), ...(stored?.profile?.user || {}) };
   const emptyProfile = {
     bio: '',
     accent_color: user.accent_color ?? null,
@@ -1249,7 +1230,7 @@ async function userProfileBody(env: Env, userId: string, guildId: string): Promi
     profile_effect: null,
     pronouns: ''
   };
-  // 拉到了就用真实的服务器成员（已退出的为 null）；还没拉到时先给一个没有身份组的成员，入群时间用第一条发言的时间代替
+  // 有记录就用真实的服务器成员（已退出的为 null）；没有记录时给一个没有身份组的成员，入群时间用第一条发言的时间代替
   const guildMember = stored
     ? (guildId === GUILD_ID ? memberWithUser(stored, user) : null)
     : {
@@ -1270,25 +1251,23 @@ async function userProfileBody(env: Env, userId: string, guildId: string): Promi
     status: 200,
     body: {
       user,
-      user_profile: synced.user_profile || emptyProfile,
-      badges: synced.badges || [],
-      guild_badges: synced.guild_badges || [],
+      user_profile: emptyProfile,
+      badges: [],
+      guild_badges: [],
       application_role_connections: [],
       mutual_guilds: guildMember ? [{ id: guildId, nick: guildMember.nick ?? null }] : [],
       mutual_friends: [],
       mutual_friends_count: 0,
       widgets: [],
       wishlist_settings: {},
-      connected_accounts: synced.connected_accounts || [],
-      premium_since: synced.premium_since ?? null,
-      premium_guild_since: synced.premium_guild_since ?? null,
-      premium_type: synced.premium_type ?? null,
-      legacy_username: synced.legacy_username ?? null,
+      connected_accounts: [],
+      premium_since: null,
+      premium_guild_since: null,
+      premium_type: null,
+      legacy_username: null,
       profile_themes_experiment_bucket: 4,
       guild_member: guildMember,
-      guild_member_profile: guildMember
-        ? (synced.guild_member_profile || { guild_id: guildId, ...emptyProfile, accent_color: null, banner: null })
-        : null
+      guild_member_profile: guildMember ? { guild_id: guildId, ...emptyProfile, accent_color: null, banner: null } : null
     }
   };
 }
@@ -2061,7 +2040,7 @@ async function officialSearchBody(url: URL, env: Env, scope: 'guilds' | 'channel
   return { status: 200, body: { analytics_id: nowSnowflake(), doing_deep_historical_index: false, total_results: results.length, messages: toHits(page) } };
 }
 
-// 身份组：sync-worker（members.ts）每 30 分钟把服务器的身份组和 features 写进 metadata.guild_roles。
+// 身份组：sync-worker（roles.ts）每 30 分钟把服务器的身份组和 features 写进 metadata.guild_roles。
 // 访客自己没有身份组，权限只看 @everyone，所以 @everyone 用归档自己的（真实服务器的 @everyone 可能看不到频道）；
 // features 只透传影响显示的：ENHANCED_ROLE_COLORS（渐变色用户名）、ROLE_ICONS（身份组图标）
 const BASE_GUILD_FEATURES = ['COMMUNITY', 'NEWS', 'THREADS_ENABLED'];
@@ -2488,8 +2467,6 @@ function officialGateway(request: Request, env: Env, ctx: ExecutionContext): Res
   let lastInsertedAt = Date.now();
   // 已经推过的消息（实时推送和心跳轮询都会碰到同一条，只发一次）
   const pushed = new Set<string>();
-  // 客户端要过、当时还没拉到资料的成员：sync-worker 拉到后，下一次心跳用 GUILD_MEMBER_UPDATE 补发（用户名随即变色）
-  const pendingMembers = new Set<string>();
   const push = (type: string, message: Message) => {
     if (!message?.id || (type === 'MESSAGE_CREATE' && pushed.has(message.id))) return;
     pushed.add(message.id);
@@ -2555,19 +2532,11 @@ function officialGateway(request: Request, env: Env, ctx: ExecutionContext): Res
             } catch (_) {}
           }
         } catch (_) {}
-        if (pendingMembers.size) {
-          const found = await readMemberProfiles(env, [...pendingMembers]);
-          for (const [id, stored] of found) {
-            pendingMembers.delete(id);
-            const member = memberWithUser(stored);
-            if (member) send(JSON.stringify({ op: 0, t: 'GUILD_MEMBER_UPDATE', d: { guild_id: GUILD_ID, ...member } }));
-          }
-        }
         return;
       }
 
       // 客户端要成员（消息作者、提及的人、@ 补全）：从 member_meta 回 GUILD_MEMBERS_CHUNK，
-      // 用户名颜色、服务器内昵称和头像都靠它。还没拉到的放进 not_found，并排进 sync-worker 的队列
+      // 用户名颜色、服务器内昵称和头像都靠它。没有记录的放进 not_found
       if (packet?.op === 8) {
         const d = packet.d || {};
         const guildIds = (Array.isArray(d.guild_id) ? d.guild_id : [d.guild_id]).map(String);
@@ -2585,11 +2554,6 @@ function officialGateway(request: Request, env: Env, ctx: ExecutionContext): Res
             const member = memberWithUser(found.get(id));
             if (member) members.push(member);
             else notFound.push(id);
-          }
-          const missing = ids.filter((id) => id !== VISITOR_USER_ID && !found.has(id));
-          if (missing.length) {
-            for (const id of missing) if (pendingMembers.size < 500) pendingMembers.add(id);
-            ctx.waitUntil(wantMembers(env, missing));
           }
         } else if (typeof d.query === 'string') {
           members = await searchMembers(env, d.query, Math.min(Math.max(Number(d.limit) || 10, 1), 100));

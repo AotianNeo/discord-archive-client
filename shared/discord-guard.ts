@@ -23,10 +23,7 @@ export class DiscordRateLimited extends Error {
 }
 
 const GLOBAL_PER_MINUTE = 40;
-const ROUTE_PER_MINUTE: Record<string, number> = {
-  search: 6, 'refresh-urls': 20, '/guilds/:id/channels': 4,
-  '/guilds/:id': 2, '/users/:id/profile': 6, '/guilds/:id/members/:id': 6 // 成员资料同步（sync-worker/src/members.ts）
-};
+const ROUTE_PER_MINUTE: Record<string, number> = { search: 6, 'refresh-urls': 20, '/guilds/:id/channels': 4, '/guilds/:id': 2 };
 const DEFAULT_ROUTE_PER_MINUTE = 12;
 const INVALID_LIMIT = 30;
 const MIN_GAP_MS = 350;

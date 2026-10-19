@@ -24,8 +24,8 @@ running the official client against a compatibility API, here as a static-site a
 - Replies, forwards (message snapshots), mentions, embeds, stickers (PNG/APNG/GIF/Lottie), custom emoji · 回复、转发、提及、嵌入、贴纸、表情
 - Attachments with automatic re-signing of expired Discord CDN links (needs `DISCORD_TOKEN`) · 附件签名过期自动续签
 - Threads and forum posts (active + archived), pinned messages, user profile cards · 子区、论坛帖子、置顶、资料卡
-- Roles, role-colored names (incl. gradients), server nicknames/avatars, server profiles, member list grouped by role ·
-  身份组、用户名颜色（含渐变）、服务器内昵称/头像、服务器资料、按身份组分组的成员列表
+- Roles, role-colored names (incl. gradients), server nicknames and avatars, member list grouped by role ·
+  身份组、用户名颜色（含渐变）、服务器内昵称和头像、按身份组分组的成员列表
 - Search: forwarded to Discord's search when a token is configured, otherwise searches the archive · 搜索
 - Read-only: sending, reacting, editing return Discord's normal "missing permissions" error · 只读
 - Optional cloud sync: a cron Worker pulls new messages and new threads every minute, behind a shared
@@ -131,27 +131,28 @@ Sync Worker (`sync-worker/wrangler.toml`): `DISCORD_GUILD_ID`, secret `DISCORD_T
 `DISCORD_TOKEN` can be a bot token (`Bot <token>`) or a user token. Thread discovery uses `threads/search`, which only
 user tokens may call; with a bot token new threads are picked up by re-running the exporter.
 
-## Roles and server profiles · 身份组与服务器资料
+## Roles and nicknames · 身份组与服务器昵称
 
-The sync Worker's second cron (`*/2 * * * *`, `sync-worker/src/members.ts`; add it to `crons` in an existing
-`wrangler.toml`) keeps the server's roles and its members' server profiles in D1:
+What a member sees while browsing: role-colored names (including gradients), server nicknames and server avatars,
+roles on profile cards, and the member list grouped by role. Only what Discord hands out in bulk is synced:
 
-- every 30 minutes `GET /guilds/:id` → `metadata.guild_roles` (roles, plus the `ENHANCED_ROLE_COLORS` / `ROLE_ICONS`
-  features that turn on gradient names and role icons). Visitors keep the archive's own `@everyone` permissions.
-- 5 members per run → `member_meta`: with a user token `GET /users/:id/profile?guild_id=` (roles, server nickname,
-  server avatar/banner, server bio and pronouns, badges); with a bot token `GET /guilds/:id/members/:id` (no server
-  profile text). Order: members a visitor's client asked for (they get colored on the open page within ~2 minutes),
-  then message authors by message count, then refreshes (members weekly, people who left monthly). About 1,300
-  authors take ~9 hours the first time. The queue is read through an index, so a run reads ~5 rows of D1.
-- the Pages gateway answers the client's member requests (op 8 → `GUILD_MEMBERS_CHUNK`), which is what colors names
-  and shows nicknames; profile cards merge the stored profile; the member list (op 37) groups members by their highest
-  hoisted role. An archive has no presence, so everyone shows as offline.
-- `scripts/export_guild.py --members` exports the same data up front (`members.json`), and `import_export.py` loads it
-  together with the roles in `guild.json`.
+- **Role list**: the sync Worker reads it with one `GET /guilds/:id` every 30 minutes.
+- **Each person's roles, nickname and server avatar**: `scripts/backfill_members.mjs` fetches them for every author
+  in one gateway session (op 8 member requests of 100 ids, the same requests the official client sends while you
+  browse); ~1,300 people take a few seconds. Re-run it to pick up new members and role changes. Members are never
+  fetched one by one.
 
-身份组与服务器资料：同步 Worker 的第二个定时任务（每 2 分钟）每 30 分钟刷新身份组，每轮拉 5 个成员的服务器资料
-（个人令牌用资料接口，含服务器内简介/代词；机器人令牌只有身份组、昵称、头像）。访客正在看的人优先，约 2 分钟内页面上的名字就会变色；
-其余按发言数排队，首次约 1,300 人需要 9 小时左右。成员列表按"单独显示"的身份组分组，归档没有在线状态，全部显示为离线。
+  ```bash
+  DISCORD_TOKEN=... node scripts/backfill_members.mjs --guild <server id> --db discord-archive-db [--local]
+  ```
+
+  With a user token run it from a normal connection: Discord rejects user-token gateway logins from Cloudflare.
+- The Pages gateway answers the client's member requests (op 8) and the member list (op 37) from D1. Visitors keep the
+  archive's own `@everyone` permissions. An archive has no presence, so the member list shows everyone offline;
+  people without a record (new since the last backfill) show without a role color.
+
+身份组与服务器昵称：只同步能批量获取的。身份组列表由同步 Worker 每 30 分钟一次请求刷新；每个人的身份组、服务器昵称和头像
+用 `scripts/backfill_members.mjs` 一次网关会话批量拉取（几秒钟），有新成员时重新运行即可，不逐个请求成员。
 
 ## Realtime sync · 实时同步
 

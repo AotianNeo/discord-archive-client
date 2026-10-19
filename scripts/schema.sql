@@ -81,20 +81,15 @@ CREATE TABLE IF NOT EXISTS user_meta (
 CREATE INDEX IF NOT EXISTS user_meta_global_name ON user_meta (global_name);
 CREATE INDEX IF NOT EXISTS user_meta_username ON user_meta (username);
 
--- Roles and server profiles per user (sync-worker/src/members.ts, or members.json at import):
--- profile = GET /users/:id/profile?guild_id= response (guild_member without user); fetched_at = 0 means not fetched yet.
--- due_at = when to fetch next; the sync queue reads (due_at, wanted_at DESC) through the index:
--- requested by a visitor's client: due_at 0, wanted_at = time; message authors: due_at 1, wanted_at = message count
+-- Server member per user: roles, server nickname and avatar, fetched in bulk by scripts/backfill_members.mjs
+-- (or members.json at import). profile = { user, guild_member } (member object without user); in_guild = 0: left the server
 CREATE TABLE IF NOT EXISTS member_meta (
     user_id TEXT PRIMARY KEY,
     in_guild INTEGER NOT NULL DEFAULT 0,
     nick TEXT,
     profile TEXT,
-    fetched_at INTEGER NOT NULL DEFAULT 0,
-    wanted_at INTEGER NOT NULL DEFAULT 0,
-    due_at INTEGER NOT NULL DEFAULT 0
+    fetched_at INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS member_meta_due ON member_meta (due_at, wanted_at DESC);
 
 -- Threads and forum posts (parent channel, archived flag); READY lists archived = 0 as active threads
 CREATE TABLE IF NOT EXISTS thread_meta (

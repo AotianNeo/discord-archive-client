@@ -102,7 +102,7 @@ def main():
         for i in range(3):
             post({'id': tid}, USERS[(n + i + 1) % 3], f'{title} reply {i + 1}')
 
-    # roles and member profiles (created last so the ids above stay stable); Bob has a server nickname, Carol a server profile
+    # roles and server members (created last so the ids above stay stable); Bob has a server nickname
     def role(name, position, color=0, secondary=None, **extra):
         return {'id': snowflake(START - timedelta(days=28)), 'name': name, 'description': None, 'permissions': '0', 'position': position,
                 'color': color, 'colors': {'primary_color': color, 'secondary_color': secondary, 'tertiary_color': None}, 'hoist': False,
@@ -113,18 +113,12 @@ def main():
     everyone = role('@everyone', 0, permissions='1071698660929', mentionable=False)
     everyone['id'] = GUILD
 
-    def member(user, roles, nick=None, bio='', pronouns=''):
-        joined = iso(START - timedelta(days=20))
-        return {'user': user, 'user_profile': {'bio': '', 'pronouns': '', 'accent_color': None, 'banner': None},
-                'badges': [], 'guild_badges': [], 'premium_type': 0, 'premium_since': None, 'premium_guild_since': None,
-                'connected_accounts': [], 'legacy_username': None,
-                'guild_member': {'roles': [r['id'] for r in roles], 'nick': nick, 'avatar': None, 'banner': None, 'joined_at': joined,
-                                 'premium_since': None, 'pending': False, 'flags': 0, 'communication_disabled_until': None,
-                                 'mute': False, 'deaf': False},
-                'guild_member_profile': {'guild_id': GUILD, 'bio': bio, 'pronouns': pronouns, 'banner': None, 'accent_color': None,
-                                         'theme_colors': None, 'popout_animation_particle_type': None, 'emoji': None, 'profile_effect': None}}
-    members = [member(USERS[0], [moderator]), member(USERS[1], [contributor], nick='Bobby (demo)'),
-               member(USERS[2], [], bio='Demo server bio for Carol.', pronouns='she/her'), member(USERS[3], [bots])]
+    def member(user, roles, nick=None):
+        return {'user': user, 'roles': [r['id'] for r in roles], 'nick': nick, 'avatar': None, 'banner': None,
+                'joined_at': iso(START - timedelta(days=20)), 'premium_since': None, 'pending': False, 'flags': 0,
+                'communication_disabled_until': None, 'mute': False, 'deaf': False}
+    members = [member(USERS[0], [moderator]), member(USERS[1], [contributor], nick='Bobby (demo)'), member(USERS[2], []),
+               member(USERS[3], [bots])]
 
     json.dump({'id': GUILD, 'name': 'Demo Server', 'icon': None, 'owner_id': OWNER['id'], 'features': ['ENHANCED_ROLE_COLORS'],
                'roles': [everyone, moderator, contributor, bots]}, open(os.path.join(args.out, 'guild.json'), 'w'))

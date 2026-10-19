@@ -61,12 +61,12 @@ await tab.evaluate(`(()=>{const i=document.querySelector('input[name=password]')
 const landed = await tab.waitFor(MSG, 45000);
 const where = await tab.evaluate('location.pathname');
 record('login lands in the official client', landed > 0 && where.startsWith(`/channels/${guild.id}/`), `path=${where} messages=${landed}`);
-const sidebar = await tab.evaluate(`[...document.querySelectorAll('[data-list-item-id^="channels___"]')].map(e=>e.innerText.trim()).join('|')`);
-record('channel list shows the server\'s channels', ['welcome', 'general', 'links', 'resources'].every((n) => sidebar.includes(n)), sidebar.slice(0, 120));
+const sidebar = await tab.waitFor(`(()=>{const t=[...document.querySelectorAll('[data-list-item-id^="channels___"]')].map(e=>e.innerText.trim()).join('|');return ['welcome','general','links','resources'].every(n=>t.includes(n))?t:''})()`, 15000) || '';
+record('channel list shows the server\'s channels', !!sidebar, sidebar.slice(0, 120));
 await tab.shot('01-landing.png');
 
-// roles and server profiles (guild.json roles + members.json): Alice is a Moderator (blue), Bob has the nickname
-// "Bobby (demo)" and the gradient Contributor role, Carol has no role but a server bio
+// roles and server members (guild.json roles + members.json): Alice is a Moderator (blue), Bob has the nickname
+// "Bobby (demo)" and the gradient Contributor role, Carol has no role
 await tab.nav(`${BASE}/channels/${guild.id}/${general.id}`);
 await tab.waitFor(MSG, 45000);
 const names = await tab.waitFor(`(()=>{const o={};for(const s of document.querySelectorAll('li[id^="chat-messages-"] [id^="message-username-"] [class*="username"]'))o[s.innerText.trim()]={color:getComputedStyle(s).color,gradient:/gradient/i.test(s.className)};return o['Alice (demo)']&&o['Bobby (demo)']?o:null})()`, 20000);
@@ -84,9 +84,9 @@ const openCard = async (name) => {
 };
 const aliceCard = await openCard('Alice (demo)');
 record('profile card lists the member\'s roles', aliceCard.includes('Moderator'), aliceCard.replace(/\n+/g, ' ').slice(0, 80));
-const carolCard = await openCard('Carol (demo)');
-record('profile card shows the server bio and pronouns', carolCard.includes('Demo server bio for Carol.') && carolCard.includes('she/her'),
-  carolCard.replace(/\n+/g, ' ').slice(0, 80));
+const bobCard = await openCard('Bobby (demo)');
+record('profile card shows the server nickname and role', bobCard.includes('Bobby (demo)') && bobCard.includes('demo_bob') && bobCard.includes('Contributor'),
+  bobCard.replace(/\n+/g, ' ').slice(0, 80));
 await tab.click('[aria-label="Show Member List"]');
 const list = await tab.waitFor(`(()=>{const t=document.querySelector('[class*="membersWrap"]')?.innerText||'';return /Moderator/.test(t)&&t.includes('Alice (demo)')?t:''})()`, 10000);
 record('member list groups members by role', !!list, (list || '').replace(/\n+/g, ' ').slice(0, 100));

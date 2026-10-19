@@ -5,8 +5,7 @@ compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
 [triggers]
-# every minute: new messages and threads; every 2 minutes: roles and member profiles (src/members.ts)
-crons = ["*/1 * * * *", "*/2 * * * *"]
+crons = ["*/1 * * * *"]
 
 [[d1_databases]]
 binding = "DB"

@@ -10,7 +10,7 @@ const esbuild = path.join(here, '..', 'pages', 'node_modules', '.bin', 'esbuild'
 const out = fs.mkdtempSync('/tmp/guard-test-');
 execFileSync(esbuild, [path.join(here, '..', 'shared', 'discord-guard.ts'), '--bundle', '--format=esm', `--outfile=${out}/guard.mjs`]);
 execFileSync(esbuild, [path.join(here, '..', 'sync-worker', 'src', 'index.ts'), '--bundle', '--format=esm', '--external:cloudflare:workers', `--outfile=${out}/sync.mjs`]);
-execFileSync(esbuild, [path.join(here, '..', 'sync-worker', 'src', 'members.ts'), '--bundle', '--format=esm', `--outfile=${out}/members.mjs`]);
+execFileSync(esbuild, [path.join(here, '..', 'sync-worker', 'src', 'roles.ts'), '--bundle', '--format=esm', `--outfile=${out}/roles.mjs`]);
 // the Workers runtime module is not available in Node: point it at a minimal DurableObject base class
 fs.writeFileSync(`${out}/cloudflare-workers.mjs`, 'export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }\n');
 fs.writeFileSync(`${out}/sync.mjs`, fs.readFileSync(`${out}/sync.mjs`, 'utf8').replace(/from\s*["']cloudflare:workers["']/g, `from "${out}/cloudflare-workers.mjs"`));
@@ -218,58 +218,21 @@ const M = (ch) => `https://discord.com/api/v10/channels/${ch}/messages?limit=50`
   check('cron: after a 429 the next runs skip without calling Discord', !!r3.skipped && !!r4.skipped && calls.length === 0, `run3=${r3.skipped} run4=${r4.skipped} calls=${calls.length}`);
 }
 
-// 7. Roles and member profiles: wanted first, then authors by message count; 404 = gone; profile route capped per minute
+// 7. Role list: one GET /guilds/:id, refreshed every 30 minutes; members are never fetched one by one
 {
   const G = '3000000000000000900';
   const env = { DB: fakeD1(), DISCORD_TOKEN: 'fake', DISCORD_GUILD_ID: G };
-  const db = env.DB.raw;
-  db.exec(`CREATE TABLE metadata (name TEXT PRIMARY KEY, payload BLOB);
-    CREATE TABLE user_meta (id TEXT PRIMARY KEY, username TEXT, message_count INTEGER);
-    INSERT INTO user_meta VALUES ('3000000000000000001', 'a', 5), ('3000000000000000002', 'b', 50), ('3000000000000000003', 'gone', 40),
-      ('3000000000000000004', 'left', 30), ('3000000000000000005', 'c', 20), ('3000000000000000006', 'd', 10), ('3000000000000000007', 'e', 1);`);
-  const members = await import(`${out}/members.mjs`);
-  db.exec(fs.readFileSync(path.join(here, '..', 'scripts', 'schema.sql'), 'utf8').match(/CREATE TABLE IF NOT EXISTS member_meta[^;]+;/)[0]);
-  db.exec(`INSERT INTO member_meta (user_id, fetched_at, wanted_at) VALUES ('3000000000000000099', 0, ${Date.now()})`);
-  const role = { id: '3000000000000000500', name: 'Mod', color: 255, position: 1, hoist: true };
+  env.DB.raw.exec('CREATE TABLE metadata (name TEXT PRIMARY KEY, payload BLOB);');
+  const { syncRoles } = await import(`${out}/roles.mjs`);
   calls = [];
-  responder = (url) => {
-    if (url.endsWith(`/guilds/${G}`)) return json({ id: G, roles: [{ id: G, name: '@everyone', position: 0 }, role], features: ['ENHANCED_ROLE_COLORS'] });
-    const uid = url.match(/users\/(\d+)\/profile/)?.[1] || url.match(/members\/(\d+)/)?.[1];
-    if (uid === '3000000000000000003') return json({ message: 'Unknown User', code: 10013 }, 404);
-    const user = { id: uid, username: 'u' + uid.slice(-1) };
-    if (uid === '3000000000000000004') return json({ user, user_profile: { bio: 'hi' }, mutual_guilds: [{ id: '1' }] });
-    const member = { user, roles: [role.id], nick: 'nick' + uid.slice(-1), joined_at: '2025-01-01T00:00:00+00:00', unusual_dm_activity_until: null };
-    return json(url.includes('/profile') ? { user, user_profile: { bio: '' }, guild_member: member, guild_member_profile: { guild_id: G, bio: 'server bio' }, mutual_guilds: [{ id: G }], widgets: [{}] } : member);
-  };
-  const headers = { Authorization: 'fake' };
-  // both runs must land in the same budget minute
-  if (new Date().getSeconds() > 50) await new Promise((r) => setTimeout(r, (61 - new Date().getSeconds()) * 1000));
-  const r1 = await members.syncMembers(env, headers);
-  const order = calls.map((c) => c.match(/users\/(\d+)\/profile/)?.[1]?.slice(-2) || 'guild');
-  const rows = Object.fromEntries(db.prepare('SELECT user_id, in_guild, nick, profile, fetched_at FROM member_meta').all().map((r) => [r.user_id.slice(-2), r]));
-  const stored = JSON.parse(rows['02'].profile);
-  const roles = JSON.parse(db.prepare("SELECT payload FROM metadata WHERE name = 'guild_roles'").get().payload);
-  check('members: roles stored; visitor-requested user first, then authors by message count',
-    roles.roles.length === 2 && roles.features[0] === 'ENHANCED_ROLE_COLORS' && order.join(',') === 'guild,99,02,03,04,05' && r1.profiles === 5,
-    `order=${order.join(',')} profiles=${r1.profiles}`);
-  check('members: profile stored without mutuals/widgets/member.user; 404 and "not a member" recorded as not in server',
-    rows['02'].in_guild === 1 && rows['02'].nick === 'nick2' && !stored.mutual_guilds && !stored.widgets && !stored.guild_member.user &&
-    !('unusual_dm_activity_until' in stored.guild_member) && stored.guild_member_profile.bio === 'server bio' &&
-    rows['03'].in_guild === 0 && rows['03'].fetched_at > 0 && rows['04'].in_guild === 0 && JSON.parse(rows['04'].profile).user_profile.bio === 'hi',
-    `02=${rows['02'].in_guild}/${rows['02'].nick} 03=${rows['03'].in_guild} 04=${rows['04'].in_guild}`);
-  calls = [];
-  const r2 = await members.syncMembers(env, headers);
-  check('members: same minute again: roles not refetched, profile route capped at 6/min', !calls.some((c) => c.endsWith(`/guilds/${G}`)) && r2.profiles === 1 && calls.length === 1,
-    `calls=${calls.length} profiles=${r2.profiles}`);
-
-  const botEnv = { DB: fakeD1(), DISCORD_TOKEN: 'Bot fake', DISCORD_GUILD_ID: G };
-  botEnv.DB.raw.exec(`CREATE TABLE metadata (name TEXT PRIMARY KEY, payload BLOB); CREATE TABLE user_meta (id TEXT PRIMARY KEY, username TEXT, message_count INTEGER);
-    INSERT INTO user_meta VALUES ('3000000000000000002', 'b', 50);`);
-  calls = [];
-  await members.syncMembers(botEnv, headers);
-  const botRow = botEnv.DB.raw.prepare('SELECT in_guild, nick, profile FROM member_meta').get();
-  check('members: bot token uses the guild member endpoint', calls.some((c) => c.includes(`/guilds/${G}/members/3000000000000000002`)) && !calls.some((c) => c.includes('/profile')) &&
-    botRow?.in_guild === 1 && JSON.parse(botRow.profile).user.id === '3000000000000000002', `calls=${calls.map((c) => c.split('/api/')[1]).join(' ; ')}`);
+  responder = (url) => json({ id: G, roles: [{ id: G, name: '@everyone', position: 0 }, { id: '3000000000000000500', name: 'Mod', color: 255, hoist: true }],
+    features: ['ENHANCED_ROLE_COLORS'] });
+  const first = await syncRoles(env, { Authorization: 'fake' });
+  const second = await syncRoles(env, { Authorization: 'fake' });
+  const stored = JSON.parse(env.DB.raw.prepare("SELECT payload FROM metadata WHERE name = 'guild_roles'").get().payload);
+  check('roles: one guild request stores roles + features; the next run within 30 min makes no request',
+    first === '2 roles' && second === 'fresh' && calls.length === 1 && calls[0].endsWith(`/guilds/${G}`) && stored.roles.length === 2 && stored.features[0] === 'ENHANCED_ROLE_COLORS',
+    `first=${first} second=${second} calls=${calls.length}`);
 }
 
 const failed = results.filter((x) => !x).length;

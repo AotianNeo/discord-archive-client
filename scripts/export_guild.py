@@ -7,8 +7,8 @@ DISCORD_TOKEN is a bot token ("Bot ..." — the bot needs View Channels + Read M
 Automating a user account is against Discord's Terms of Service; prefer a bot you added to the server.
 
 Writes export/guild.json, export/channels.json and export/messages/<channel id>.json (Discord message objects).
-With --members it also writes export/members.json: roles, server nickname/avatar and server profile of every message author
-(one request per author; the sync worker fills these in on its own too, a few per run).
+Members' roles and server nicknames are not exported here: after importing, scripts/backfill_members.mjs fetches them
+in bulk through the gateway.
 Re-running resumes: channels that already have a file only fetch messages newer than the newest one saved.
 Requests are sequential and paced by Discord's rate-limit headers.
 """
@@ -122,7 +122,6 @@ def main():
     ap.add_argument('--guild', required=True)
     ap.add_argument('--out', default='export')
     ap.add_argument('--channels', help='comma-separated channel ids (default: every readable channel)')
-    ap.add_argument('--members', action='store_true', help='also export the roles and server profile of every message author')
     args = ap.parse_args()
     if not TOKEN:
         sys.exit('set DISCORD_TOKEN')
@@ -150,25 +149,6 @@ def main():
     for c in [c for c in readable if c['type'] in (0, 5)] + list(threads.values()):
         n = export_messages(c['id'], os.path.join(args.out, 'messages', f"{c['id']}.json"))
         print(f"#{c.get('name')}: +{n}", file=sys.stderr)
-
-    if args.members:
-        authors = set()
-        for name in os.listdir(os.path.join(args.out, 'messages')):
-            for m in json.load(open(os.path.join(args.out, 'messages', name), encoding='utf-8')):
-                if (m.get('author') or {}).get('id'):
-                    authors.add(m['author']['id'])
-        members = []
-        for i, uid in enumerate(sorted(authors)):
-            if IS_BOT:  # bots have no profile endpoint: roles, nickname and server avatar only
-                found = get(f'/guilds/{args.guild}/members/{uid}')
-            else:
-                found = get(f'/users/{uid}/profile?with_mutual_guilds=false&with_mutual_friends=false&guild_id={args.guild}')
-            if found:
-                members.append(found)
-            if (i + 1) % 100 == 0:
-                print(f'  {i + 1}/{len(authors)} members…', file=sys.stderr)
-        json.dump(members, open(os.path.join(args.out, 'members.json'), 'w', encoding='utf-8'), ensure_ascii=False)
-        print(f'{len(members)} member profiles of {len(authors)} authors', file=sys.stderr)
 
 
 if __name__ == '__main__':

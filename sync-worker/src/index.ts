@@ -6,7 +6,7 @@
 import { DiscordRateLimited, discordFetch, discordRateState } from '../../shared/discord-guard';
 import { compareSnowflake, toRecord, writeRecords } from './records';
 import { DiscordGateway, gatewayStub } from './gateway';
-import { syncMembers } from './members';
+import { syncRoles } from './roles';
 
 export { DiscordGateway };
 
@@ -19,9 +19,6 @@ export interface Env {
   REALTIME_GATEWAY?: string;      // "true" = 用 Discord 网关实时同步（gateway.ts），REST 轮询降为每 10 分钟补漏
   GATEWAY: DurableObjectNamespace;
 }
-
-// 身份组和成员资料（members.ts）用第二个 Cron 单独跑：D1 对每次调用的查询数有上限（免费版 50），不和消息同步挤在一次调用里
-const MEMBER_CRON = '*/2 * * * *';
 
 const GATEWAY_HEALTHY_MS = 120_000;   // 网关这么久内有事件才算健康
 const BACKSTOP_EVERY_MINUTES = 10;    // 网关健康时 REST 补漏的间隔
@@ -39,6 +36,13 @@ async function touchHeartbeat(env: Env): Promise<void> {
 }
 
 async function runMinute(env: Env, scheduledTime: number): Promise<void> {
+  // 身份组列表（每 30 分钟真正请求一次，其余分钟只读一行 metadata）
+  try {
+    const roles = await syncRoles(env, { Authorization: env.DISCORD_TOKEN, 'User-Agent': USER_AGENT });
+    if (roles !== 'fresh') console.log(`[Roles] ${roles}`);
+  } catch (err: any) {
+    console.warn('[Roles] 跳过:', err.message);
+  }
   if (env.REALTIME_GATEWAY === 'true' && env.GATEWAY && env.DISCORD_GUILD_ID) {
     let status: any = null;
     try {
@@ -290,13 +294,6 @@ export async function syncAllChannels(env: Env): Promise<{
 export default {
   // 1. 每分钟自动由 Cloudflare Cron Trigger 触发 (100% 云端免维护)
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    if (event.cron === MEMBER_CRON) {
-      ctx.waitUntil(syncMembers(env, { Authorization: env.DISCORD_TOKEN, 'User-Agent': USER_AGENT }).then(
-        (r) => console.log(`[Members] 身份组: ${r.roles}；成员资料 +${r.profiles}`),
-        (err) => console.warn('[Members] 同步失败:', err.message)
-      ));
-      return;
-    }
     ctx.waitUntil(runMinute(env, event.scheduledTime));
   },
 
@@ -317,13 +314,11 @@ export default {
     }
     let members: unknown = null;
     try {
-      members = await env.DB.prepare(
-        'SELECT COUNT(*) AS known, SUM(in_guild) AS in_guild, SUM(fetched_at = 0) AS waiting, MAX(fetched_at) AS last_fetched_at FROM member_meta'
-      ).first();
+      members = await env.DB.prepare('SELECT COUNT(*) AS known, SUM(in_guild) AS in_guild, MAX(fetched_at) AS backfilled_at FROM member_meta').first();
     } catch (_) {}
     return Response.json({
       service: 'sync-worker',
-      schedule: ['*/1 * * * *', MEMBER_CRON],
+      schedule: '*/1 * * * *',
       members,
       gateway,
       heartbeat,
