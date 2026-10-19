@@ -4,7 +4,8 @@
 
 ```
 export/
-  guild.json               Discord guild object (optional; owner_id is used for the owner flag)
+  guild.json               Discord guild object (optional; owner_id is used for the owner flag, roles/features for the role list)
+  members.json             optional: GET /users/:id/profile?guild_id= responses or guild member objects (export_guild.py --members)
   channels.json            array of Discord channel objects: GET /guilds/:id/channels
                            + thread / forum-post channel objects (type 11/12, with parent_id and thread_metadata)
   messages/<channel>.json  array of Discord message objects (GET /channels/:id/messages), any order
@@ -42,11 +43,12 @@ See `scripts/schema.sql`. In short:
 
 | Table | Filled by | Used for |
 |---|---|---|
-| `metadata` | importer, sync | channel groups (`channels`), user names (`users`), cron heartbeat, sync state |
+| `metadata` | importer, sync | channel groups (`channels`), user names (`users`), roles (`guild_roles`), cron heartbeat, sync state |
 | `blocks`, `block_index` | importer | archived history, paged by message id |
 | `message_cache`, `sync_status` | sync worker, on-demand sync | messages newer than the import |
 | `attachment_meta` | importer, Pages worker | canonical CDN path + freshly signed URL per attachment |
 | `user_meta` | importer | profile cards, avatars, mentions, reply authors |
+| `member_meta` | importer, sync worker, Pages worker (queue) | roles, server nickname/avatar and server profile per user |
 | `thread_meta` | importer, sync worker | threads / forum posts and their archived state |
 | `pin_meta` | importer | pinned messages |
 | `snapshot_meta` | (legacy archives) | forwarded content for blocks written without `snapshots` |

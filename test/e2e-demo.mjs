@@ -65,12 +65,39 @@ const sidebar = await tab.evaluate(`[...document.querySelectorAll('[data-list-it
 record('channel list shows the server\'s channels', ['welcome', 'general', 'links', 'resources'].every((n) => sidebar.includes(n)), sidebar.slice(0, 120));
 await tab.shot('01-landing.png');
 
+// roles and server profiles (guild.json roles + members.json): Alice is a Moderator (blue), Bob has the nickname
+// "Bobby (demo)" and the gradient Contributor role, Carol has no role but a server bio
+await tab.nav(`${BASE}/channels/${guild.id}/${general.id}`);
+await tab.waitFor(MSG, 45000);
+const names = await tab.waitFor(`(()=>{const o={};for(const s of document.querySelectorAll('li[id^="chat-messages-"] [id^="message-username-"] [class*="username"]'))o[s.innerText.trim()]={color:getComputedStyle(s).color,gradient:/gradient/i.test(s.className)};return o['Alice (demo)']&&o['Bobby (demo)']?o:null})()`, 20000);
+record('names use role colors and server nicknames', !!names && names['Alice (demo)'].color === 'rgb(52, 152, 219)' && names['Bobby (demo)'].gradient,
+  JSON.stringify(names || {}).slice(0, 160));
+const openCard = async (name) => {
+  const p = await tab.evaluate(`(()=>{const e=[...document.querySelectorAll('li[id^="chat-messages-"] [id^="message-username-"] [class*="username"]')].filter(e=>e.innerText.trim()===${JSON.stringify(name)}).pop();if(!e)return null;e.scrollIntoView({block:'center'});return 1})()`);
+  if (!p) return '';
+  await sleep(800);
+  const pos = await tab.evaluate(`(()=>{const e=[...document.querySelectorAll('li[id^="chat-messages-"] [id^="message-username-"] [class*="username"]')].filter(e=>e.innerText.trim()===${JSON.stringify(name)}).pop();const r=e.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()`);
+  for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) await tab.send('Input.dispatchMouseEvent', { type, x: pos.x, y: pos.y, button: 'left', clickCount: 1 });
+  const text = await tab.waitFor(`document.querySelector('[class*="user-profile-popout"]')?.innerText||''`, 8000);
+  await tab.key('Escape');
+  return text || '';
+};
+const aliceCard = await openCard('Alice (demo)');
+record('profile card lists the member\'s roles', aliceCard.includes('Moderator'), aliceCard.replace(/\n+/g, ' ').slice(0, 80));
+const carolCard = await openCard('Carol (demo)');
+record('profile card shows the server bio and pronouns', carolCard.includes('Demo server bio for Carol.') && carolCard.includes('she/her'),
+  carolCard.replace(/\n+/g, ' ').slice(0, 80));
+await tab.click('[aria-label="Show Member List"]');
+const list = await tab.waitFor(`(()=>{const t=document.querySelector('[class*="membersWrap"]')?.innerText||'';return /Moderator/.test(t)&&t.includes('Alice (demo)')?t:''})()`, 10000);
+record('member list groups members by role', !!list, (list || '').replace(/\n+/g, ' ').slice(0, 100));
+await tab.click('[aria-label="Hide Member List"]');
+
 await tab.nav(`${BASE}/channels/${guild.id}/${general.id}/${forward.id}`);
 const fwd = await tab.waitFor(`(()=>{const li=document.getElementById('chat-messages-${general.id}-${forward.id}');return li&&li.innerText.includes('Handy reference')?'ok':''})()`, 45000);
 record('forwarded message shows its content', !!fwd);
 await tab.nav(`${BASE}/channels/${guild.id}/${general.id}/${reply.id}`);
 const bar = await tab.waitFor(`(()=>{const li=document.getElementById('chat-messages-${general.id}-${reply.id}');const r=li&&li.querySelector('[id^="message-reply-context-"]');return r?r.innerText.slice(0,60):''})()`, 45000);
-record('reply shows the replied-to message', !!bar && bar.includes('Bob (demo)'), bar || 'no reply bar');
+record('reply shows the replied-to message', !!bar && /Bob(by)? \(demo\)/.test(bar), bar || 'no reply bar');
 await tab.shot('02-forward-reply.png');
 
 await tab.nav(`${BASE}/channels/${guild.id}/${general.id}`);
@@ -84,7 +111,7 @@ record('scrolling up loads older history', !!older, `${before} → ${older || be
 const avatar = await tab.evaluate(`(()=>{const a=[...document.querySelectorAll('li[id^="chat-messages-"] img[class*="avatar"]')].filter(i=>{const r=i.getBoundingClientRect();return r.y>120&&r.y<innerHeight-160}).pop();if(!a)return null;const r=a.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()`);
 if (avatar) for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) await tab.send('Input.dispatchMouseEvent', { type, x: avatar.x, y: avatar.y, button: 'left', clickCount: 1 });
 const card = await tab.waitFor(`document.querySelector('[class*="user-profile-popout"]')?.innerText.slice(0,40)||''`, 8000);
-record('clicking an avatar opens that user\'s profile card', !!card && /(Alice|Bob|Carol) \(demo\)/.test(card), (card || '').replace(/\n/g, ' '));
+record('clicking an avatar opens that user\'s profile card', !!card && /(Alice|Bobby?|Carol) \(demo\)/.test(card), (card || '').replace(/\n/g, ' '));
 await tab.key('Escape');
 
 await tab.nav(`${BASE}/channels/${guild.id}/${welcome.id}`);

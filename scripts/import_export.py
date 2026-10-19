@@ -7,7 +7,8 @@ Export directory:
     channels.json            Discord channel objects (GET /guilds/:id/channels) plus thread / forum-post channel objects
     messages/<channel>.json  Discord message objects (GET /channels/:id/messages), any order, one file per channel or thread
                              (file names may carry a suffix: <channel>_<name>.json)
-    guild.json (optional)    Discord guild object; owner_id is used when --owner is not given
+    guild.json (optional)    Discord guild object; owner_id is used when --owner is not given, roles/features become the role list
+    members.json (optional)  member profiles: GET /users/:id/profile?guild_id= responses, or guild member objects (with user)
 
 Output (applied in file-name order):
     00_schema.sql, 01_metadata.sql, 02_blocks_NNN.sql, 03_block_index.sql, 04_side_tables.sql
@@ -20,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from collections import defaultdict
 from urllib.parse import urlsplit
 
@@ -147,7 +149,8 @@ def main():
 
     channels = json.load(open(os.path.join(args.export, 'channels.json'), encoding='utf-8'))
     guild_file = os.path.join(args.export, 'guild.json')
-    owner = args.owner or (json.load(open(guild_file, encoding='utf-8')).get('owner_id', '') if os.path.exists(guild_file) else '')
+    guild = json.load(open(guild_file, encoding='utf-8')) if os.path.exists(guild_file) else {}
+    owner = args.owner or guild.get('owner_id', '')
     channel_names = {str(c['id']): c.get('name') or '' for c in channels}
     messages = load_messages(args.export)
     os.makedirs(args.out, exist_ok=True)
@@ -190,6 +193,10 @@ def main():
         for name, payload in (('channels', meta_channels), ('users', users)):
             blob = cctx.compress(json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode())
             fh.write(f"INSERT OR REPLACE INTO metadata (name, payload) VALUES ('{name}', X'{blob.hex()}');\n")
+        if guild.get('roles'):
+            # plain JSON with fetched_at 0: the sync worker refreshes it on its first run
+            roles = json.dumps({'roles': guild['roles'], 'features': guild.get('features') or [], 'fetched_at': 0}, ensure_ascii=False)
+            fh.write(f"INSERT OR REPLACE INTO metadata (name, payload) VALUES ('guild_roles', {lit(roles)});\n")
         for cid, msgs in messages.items():
             if msgs:
                 fh.write(f"INSERT OR REPLACE INTO sync_status (channel_id, last_refreshed_at, latest_message_id) VALUES ({lit(cid)}, 0, {lit(msgs[-1]['id'])});\n")
@@ -248,6 +255,23 @@ def main():
             fh.write('INSERT OR REPLACE INTO thread_meta (id, parent_id, name, owner_id, message_count, last_message_id, archived) VALUES (' + ','.join(lit(x) for x in (
                 str(t['id']), str(t.get('parent_id') or ''), t.get('name') or '', str(owner_id), len(msgs),
                 msgs[-1]['id'] if msgs else str(t.get('last_message_id') or t['id']), archived)) + ');\n')
+        members_file = os.path.join(args.export, 'members.json')
+        members = json.load(open(members_file, encoding='utf-8')) if os.path.exists(members_file) else []
+        now = int(time.time() * 1000)
+        for p in members:
+            if 'roles' in p and 'guild_member' not in p:  # a guild member object -> profile shape
+                p = {'user': p.get('user'), 'guild_member': p}
+            p = {k: v for k, v in p.items() if k not in ('mutual_guilds', 'mutual_friends', 'mutual_friends_count', 'widgets',
+                                                         'profile_themes_experiment_bucket')}
+            if p.get('guild_member'):
+                p['guild_member'] = {k: v for k, v in p['guild_member'].items() if k not in ('user', 'unusual_dm_activity_until')}
+            uid = str((p.get('user') or {}).get('id') or '')
+            if not uid:
+                continue
+            gm = p.get('guild_member')
+            due = now + (7 if gm else 30) * 86_400_000  # the sync worker refreshes members weekly, ones who left monthly
+            fh.write('INSERT OR REPLACE INTO member_meta (user_id, in_guild, nick, profile, fetched_at, due_at) VALUES (' + ','.join(lit(x) for x in (
+                uid, 1 if gm else 0, (gm or {}).get('nick'), json.dumps(p, ensure_ascii=False), now, due)) + ');\n')
         for cid, msgs in messages.items():
             notices = {(m.get('message_reference') or {}).get('message_id'): m.get('timestamp') for m in msgs if m.get('type') == 6}
             for m in msgs:
@@ -256,7 +280,8 @@ def main():
 
     total = sum(len(m) for m in messages.values())
     print(f'{total} messages in {len(messages)} channels/threads -> {len(blocks)} blocks, {len(user_rows)} users, '
-          f'{len(seen)} attachments, {len(threads)} threads; SQL in {args.out}', file=sys.stderr)
+          f'{len(seen)} attachments, {len(threads)} threads, {len(guild.get("roles") or [])} roles, {len(members)} member profiles; '
+          f'SQL in {args.out}', file=sys.stderr)
 
     if args.apply:
         if not args.db:

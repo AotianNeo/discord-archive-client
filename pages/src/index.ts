@@ -2,6 +2,7 @@ import { decompress } from 'fzstd';
 import { Deflate } from 'pako';
 import { discordFetch } from '../../shared/discord-guard';
 import { ArchiveSnapshot, MESSAGE_REFERENCE_FORWARD, isForward, snapshotsFromDiscord } from '../../shared/message-snapshots';
+import { GUILD_ROLES_KEY, ensureMemberTable } from '../../shared/members';
 import guildExperiments from './experiments/guild_experiments.json';
 import userExperiments from './experiments/user_experiments.json';
 import apexExperiments from './experiments/apex_experiments.json';
@@ -44,6 +45,11 @@ function configure(env: Env): void {
   LOCALE = (env.LOCALE || '').trim() || 'en-US';
   COUNTRY_CODE = (env.COUNTRY_CODE || '').trim().toUpperCase() || 'US';
 }
+
+// Discord CDN 上不需要签名的公开图片，直接回源 cdn.discordapp.com：头像、表情、贴纸、服务器图标，
+// 以及成员资料用到的服务器内头像/横幅（/guilds/:id/users/:id/...）、用户横幅、身份组图标、徽章、头像装饰、服务器标签徽章
+const CDN_IMAGE_PREFIXES = ['/avatars/', '/emojis/', '/icons/', '/stickers/', '/guilds/', '/banners/', '/role-icons/',
+  '/badge-icons/', '/avatar-decoration-presets/', '/clan-badges/', '/guild-tag-badges/'];
 
 const MEDIA_RESET_COOKIE = 'media_reset';
 const MEDIA_RESET_VERSION = '20261018-avatar-size';
@@ -1106,46 +1112,152 @@ function userMetaToDiscord(meta: UserMeta): any {
   };
 }
 
+// 成员资料（sync-worker 的 members.ts 写入 member_meta）：身份组、服务器内昵称/头像/横幅、服务器资料（简介、代词）。
+// 结果只含已经拉到的；没拉过的（包括访客要过、还在排队的）不在里面
+interface StoredMember { in_guild: number; profile: any }
+
+async function readMemberProfiles(env: Env, ids: string[]): Promise<Map<string, StoredMember>> {
+  const out = new Map<string, StoredMember>();
+  try {
+    for (let i = 0; i < ids.length; i += 90) { // D1 每条语句最多 100 个绑定参数
+      const part = ids.slice(i, i + 90);
+      const rows = await env.DB.prepare(
+        `SELECT user_id, in_guild, profile FROM member_meta WHERE fetched_at > 0 AND user_id IN (${part.map(() => '?').join(',')})`
+      ).bind(...part).all<{ user_id: string; in_guild: number; profile: string | null }>();
+      for (const row of rows.results || []) {
+        let profile = null;
+        try { profile = row.profile ? JSON.parse(row.profile) : null; } catch (_) {}
+        out.set(String(row.user_id), { in_guild: Number(row.in_guild) || 0, profile });
+      }
+    }
+  } catch (_) {} // 还没有 member_meta 表（sync-worker 没跑过）
+  return out;
+}
+
+// 访客的客户端要了、库里还没有的成员：记下来，sync-worker 下一轮优先拉
+async function wantMembers(env: Env, ids: string[]): Promise<void> {
+  const wanted = ids.filter((id) => id !== VISITOR_USER_ID).slice(0, 100);
+  if (!wanted.length) return;
+  try {
+    await ensureMemberTable(env.DB);
+    const now = Date.now();
+    await env.DB.batch(wanted.map((id) => env.DB.prepare(
+      'INSERT INTO member_meta (user_id, wanted_at, due_at) VALUES (?, ?, 0) ' +
+      'ON CONFLICT(user_id) DO UPDATE SET wanted_at = excluded.wanted_at, due_at = 0 WHERE member_meta.fetched_at = 0'
+    ).bind(id, now)));
+  } catch (err) {
+    console.warn('[Members] 记录待拉成员失败:', err);
+  }
+}
+
+// 网关里的成员对象（GUILD_MEMBERS_CHUNK / GUILD_MEMBER_UPDATE）；不在服务器里的返回 null
+function memberWithUser(stored: StoredMember | undefined, fallbackUser?: any): any | null {
+  if (!stored?.in_guild || !stored.profile?.guild_member) return null;
+  return { ...stored.profile.guild_member, user: { ...(fallbackUser || {}), ...(stored.profile.user || {}) } };
+}
+
+// 网关 op 8 按名字找成员（@ 提及、搜索 from: 的补全）：服务器内昵称、用户名、显示名前缀匹配
+async function searchMembers(env: Env, query: string, limit: number): Promise<any[]> {
+  const pattern = query.toLowerCase().replace(/[\\%_]/g, (c) => '\\' + c) + '%';
+  try {
+    const rows = await env.DB.prepare(
+      "SELECT user_id, in_guild, profile FROM member_meta WHERE fetched_at > 0 AND in_guild = 1 AND (lower(nick) LIKE ?1 ESCAPE '\\' OR " +
+      "lower(json_extract(profile, '$.user.username')) LIKE ?1 ESCAPE '\\' OR lower(json_extract(profile, '$.user.global_name')) LIKE ?1 ESCAPE '\\') LIMIT ?2"
+    ).bind(pattern, limit).all<{ user_id: string; in_guild: number; profile: string | null }>();
+    return (rows.results || []).map((row) => {
+      let profile = null;
+      try { profile = row.profile ? JSON.parse(row.profile) : null; } catch (_) {}
+      return memberWithUser({ in_guild: Number(row.in_guild) || 0, profile });
+    }).filter(Boolean);
+  } catch (_) {
+    return [];
+  }
+}
+
+// 成员列表（GUILD_MEMBER_LIST_UPDATE）。归档没有在线状态：成员按最高的"单独显示"身份组分组（官方对在线成员的分法），
+// 其余放进"离线"组，状态都显示离线。排序索引只取身份组和名字（不解析整份资料），按区间再读那 100 个人的资料
+interface MemberListIndex { at: number; total: number; groups: Array<{ id: string; count: number }>; items: Array<{ group?: string; count?: number; member?: string }> }
+let memberListCache: MemberListIndex | null = null;
+
+async function memberListIndex(env: Env): Promise<MemberListIndex> {
+  if (memberListCache && Date.now() - memberListCache.at < 60_000) return memberListCache;
+  const hoisted = (await guildRoles(env, GUILD_ID))
+    .filter((role) => role.hoist && String(role.id) !== GUILD_ID)
+    .sort((a, b) => Number(b.position) - Number(a.position));
+  let rows: Array<{ user_id: string; roles: string | null; name: string | null }> = [];
+  try {
+    rows = (await env.DB.prepare(
+      "SELECT user_id, json_extract(profile, '$.guild_member.roles') AS roles, " +
+      "coalesce(nick, json_extract(profile, '$.user.global_name'), json_extract(profile, '$.user.username')) AS name " +
+      'FROM member_meta WHERE fetched_at > 0 AND in_guild = 1'
+    ).all<{ user_id: string; roles: string | null; name: string | null }>()).results || [];
+  } catch (_) {}
+  const byGroup = new Map<string, Array<{ id: string; name: string }>>();
+  for (const row of rows) {
+    let roleIds: string[] = [];
+    try { roleIds = JSON.parse(row.roles || '[]').map(String); } catch (_) {}
+    const group = String(hoisted.find((role) => roleIds.includes(String(role.id)))?.id || 'offline');
+    if (!byGroup.has(group)) byGroup.set(group, []);
+    byGroup.get(group)!.push({ id: String(row.user_id), name: row.name || '' });
+  }
+  const groups: MemberListIndex['groups'] = [];
+  const items: MemberListIndex['items'] = [];
+  for (const group of [...hoisted.map((role) => String(role.id)), 'offline']) {
+    const members = byGroup.get(group);
+    if (!members?.length) continue;
+    members.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+    groups.push({ id: group, count: members.length });
+    items.push({ group, count: members.length }, ...members.map((member) => ({ member: member.id })));
+  }
+  memberListCache = { at: Date.now(), total: rows.length, groups, items };
+  return memberListCache;
+}
+
+async function memberListUpdate(env: Env, ranges: number[][]): Promise<any> {
+  const index = await memberListIndex(env);
+  const ops: any[] = [];
+  for (const range of ranges.slice(0, 5)) {
+    const start = Math.max(0, Number(range?.[0]) || 0);
+    const end = Math.min(start + 199, Math.max(start, Number(range?.[1]) || 0));
+    const slice = index.items.slice(start, end + 1);
+    const found = await readMemberProfiles(env, slice.flatMap((item) => (item.member ? [item.member] : [])));
+    const items = slice.map((item) => {
+      if (!item.member) return { group: { id: item.group, count: item.count } };
+      const member = memberWithUser(found.get(item.member));
+      return member && { member: { ...member, presence: { user: { id: item.member }, status: 'offline', activities: [], client_status: {} } } };
+    }).filter(Boolean);
+    ops.push({ op: 'SYNC', range: [start, end], items });
+  }
+  return { id: 'everyone', guild_id: GUILD_ID, member_count: index.total, online_count: 0, groups: index.groups, ops };
+}
+
 async function userProfileBody(env: Env, userId: string, guildId: string): Promise<{ status: number; body: unknown }> {
-  const meta = await readUserMeta(env, userId);
-  if (!meta) return { status: 404, body: { message: 'Unknown User', code: 10013 } };
-  const user = userMetaToDiscord(meta);
+  const [meta, members] = await Promise.all([readUserMeta(env, userId), readMemberProfiles(env, [userId])]);
+  const stored = members.get(userId);
+  if (!meta && !stored?.profile?.user) return { status: 404, body: { message: 'Unknown User', code: 10013 } };
+  if (!stored) await wantMembers(env, [userId]); // 还没拉过：排到下一轮
+  const synced = stored?.profile || {};
+  // 资料接口拿到的用户对象更新（当前头像、显示名样式、服务器标签），归档里的作为兜底
+  const user = { ...(meta ? userMetaToDiscord(meta) : {}), ...(synced.user || {}) };
   const emptyProfile = {
     bio: '',
-    accent_color: meta.accent_color,
-    banner: meta.banner,
+    accent_color: user.accent_color ?? null,
+    banner: user.banner ?? null,
     theme_colors: null,
     popout_animation_particle_type: null,
     emoji: null,
     profile_effect: null,
     pronouns: ''
   };
-  return {
-    status: 200,
-    body: {
-      user,
-      user_profile: emptyProfile,
-      badges: [],
-      guild_badges: [],
-      application_role_connections: [],
-      mutual_guilds: [{ id: guildId, nick: null }],
-      mutual_friends: [],
-      mutual_friends_count: 0,
-      widgets: [],
-      wishlist_settings: {},
-      connected_accounts: [],
-      premium_since: null,
-      premium_guild_since: null,
-      premium_type: null,
-      legacy_username: null,
-      profile_themes_experiment_bucket: 4,
-      // 归档里没有入群时间，用第一条发言的时间代替
-      guild_member: {
+  // 拉到了就用真实的服务器成员（已退出的为 null）；还没拉到时先给一个没有身份组的成员，入群时间用第一条发言的时间代替
+  const guildMember = stored
+    ? (guildId === GUILD_ID ? memberWithUser(stored, user) : null)
+    : {
         avatar: null,
         banner: null,
         communication_disabled_until: null,
         flags: 0,
-        joined_at: snowflakeIso(meta.first_message_id),
+        joined_at: snowflakeIso(meta?.first_message_id || userId),
         nick: null,
         pending: false,
         premium_since: null,
@@ -1153,8 +1265,30 @@ async function userProfileBody(env: Env, userId: string, guildId: string): Promi
         user,
         mute: false,
         deaf: false
-      },
-      guild_member_profile: { guild_id: guildId, ...emptyProfile, accent_color: null, banner: null }
+      };
+  return {
+    status: 200,
+    body: {
+      user,
+      user_profile: synced.user_profile || emptyProfile,
+      badges: synced.badges || [],
+      guild_badges: synced.guild_badges || [],
+      application_role_connections: [],
+      mutual_guilds: guildMember ? [{ id: guildId, nick: guildMember.nick ?? null }] : [],
+      mutual_friends: [],
+      mutual_friends_count: 0,
+      widgets: [],
+      wishlist_settings: {},
+      connected_accounts: synced.connected_accounts || [],
+      premium_since: synced.premium_since ?? null,
+      premium_guild_since: synced.premium_guild_since ?? null,
+      premium_type: synced.premium_type ?? null,
+      legacy_username: synced.legacy_username ?? null,
+      profile_themes_experiment_bucket: 4,
+      guild_member: guildMember,
+      guild_member_profile: guildMember
+        ? (synced.guild_member_profile || { guild_id: guildId, ...emptyProfile, accent_color: null, banner: null })
+        : null
     }
   };
 }
@@ -1927,7 +2061,52 @@ async function officialSearchBody(url: URL, env: Env, scope: 'guilds' | 'channel
   return { status: 200, body: { analytics_id: nowSnowflake(), doing_deep_historical_index: false, total_results: results.length, messages: toHits(page) } };
 }
 
-function officialGuildObject(guildId: string) {
+// 身份组：sync-worker（members.ts）每 30 分钟把服务器的身份组和 features 写进 metadata.guild_roles。
+// 访客自己没有身份组，权限只看 @everyone，所以 @everyone 用归档自己的（真实服务器的 @everyone 可能看不到频道）；
+// features 只透传影响显示的：ENHANCED_ROLE_COLORS（渐变色用户名）、ROLE_ICONS（身份组图标）
+const BASE_GUILD_FEATURES = ['COMMUNITY', 'NEWS', 'THREADS_ENABLED'];
+const DISPLAY_GUILD_FEATURES = ['ENHANCED_ROLE_COLORS', 'ROLE_ICONS'];
+
+let syncedRolesCache: { at: number; value: { roles: any[]; features: string[] } | null } | null = null;
+
+async function readSyncedRoles(env: Env): Promise<{ roles: any[]; features: string[] } | null> {
+  if (syncedRolesCache && Date.now() - syncedRolesCache.at < 60_000) return syncedRolesCache.value;
+  let value = null;
+  try {
+    const row = await env.DB.prepare('SELECT payload FROM metadata WHERE name = ?').bind(GUILD_ROLES_KEY).first<{ payload: unknown }>();
+    const data = row?.payload ? unpack(row.payload) : null;
+    if (Array.isArray(data?.roles)) value = { roles: data.roles, features: Array.isArray(data.features) ? data.features : [] };
+  } catch (_) {}
+  syncedRolesCache = { at: Date.now(), value };
+  return value;
+}
+
+async function guildRoles(env: Env, guildId: string): Promise<any[]> {
+  const everyone = {
+    id: guildId,
+    name: '@everyone',
+    description: null,
+    color: 0,
+    colors: { primary_color: 0, secondary_color: null, tertiary_color: null },
+    hoist: false,
+    icon: null,
+    unicode_emoji: null,
+    position: 0,
+    permissions: '1071698660929',
+    managed: false,
+    mentionable: false,
+    flags: 0
+  };
+  const synced = guildId === GUILD_ID ? await readSyncedRoles(env) : null;
+  return [everyone, ...(synced?.roles || []).filter((role) => role?.id && String(role.id) !== guildId)];
+}
+
+async function guildFeatures(env: Env): Promise<string[]> {
+  const synced = await readSyncedRoles(env);
+  return [...BASE_GUILD_FEATURES, ...DISPLAY_GUILD_FEATURES.filter((feature) => synced?.features.includes(feature))];
+}
+
+async function officialGuildObject(env: Env, guildId: string) {
   return {
     id: guildId,
     name: GUILD_NAME,
@@ -1936,21 +2115,9 @@ function officialGuildObject(guildId: string) {
     banner: null,
     owner_id: GUILD_OWNER_ID,
     permissions: '2147483647',
-    roles: [
-      {
-        id: guildId,
-        name: '@everyone',
-        color: 0,
-        hoist: false,
-        position: 0,
-        permissions: '1071698660929',
-        managed: false,
-        mentionable: false,
-        flags: 0
-      }
-    ],
+    roles: await guildRoles(env, guildId),
     emojis: [],
-    features: ['COMMUNITY', 'NEWS', 'THREADS_ENABLED'],
+    features: await guildFeatures(env),
     verification_level: 0,
     default_message_notifications: 0,
     explicit_content_filter: 0,
@@ -2103,7 +2270,7 @@ async function officialApiBody(url: URL, env: Env, request?: Request): Promise<{
   if (selfMember) {
     // 客户端打开频道时如果频道还没进 store（READY 之前），会以 lurker 身份 PUT 加入服务器；访客已是成员，按官方返回服务器对象
     if (method === 'PUT') {
-      return { status: 200, body: { ...officialGuildObject(selfMember[1]), join_request: null, show_verification_form: false, welcome_screen: null } };
+      return { status: 200, body: { ...(await officialGuildObject(env, selfMember[1])), join_request: null, show_verification_form: false, welcome_screen: null } };
     }
     if (method !== 'GET') return READ_ONLY;
     return {
@@ -2121,9 +2288,8 @@ async function officialApiBody(url: URL, env: Env, request?: Request): Promise<{
   const otherMember = path.match(/^\/guilds\/(\d+)\/members\/(\d+)$/);
   if (otherMember && method === 'GET') {
     const profile = await userProfileBody(env, otherMember[2], otherMember[1]);
-    return profile.status === 200
-      ? { status: 200, body: (profile.body as any).guild_member }
-      : { status: 404, body: { message: 'Unknown Member', code: 10007 } };
+    const member = profile.status === 200 ? (profile.body as any).guild_member : null;
+    return member ? { status: 200, body: member } : { status: 404, body: { message: 'Unknown Member', code: 10007 } };
   }
 
   // 10. Guild Details, Channels, Roles, Members
@@ -2171,24 +2337,7 @@ async function officialApiBody(url: URL, env: Env, request?: Request): Promise<{
       }
       return { status: 200, body: channels };
     }
-    if (sub === 'roles') {
-      return {
-        status: 200,
-        body: [
-          {
-            id: targetGuildId,
-            name: '@everyone',
-            color: 0,
-            hoist: false,
-            position: 0,
-            permissions: '1071698660929',
-            managed: false,
-            mentionable: false,
-            flags: 0
-          }
-        ]
-      };
-    }
+    if (sub === 'roles') return { status: 200, body: await guildRoles(env, targetGuildId) };
     if (sub === 'members' || sub === 'member-ids') {
       const member = {
         user: userObj,
@@ -2200,7 +2349,7 @@ async function officialApiBody(url: URL, env: Env, request?: Request): Promise<{
       };
       return { status: 200, body: sub === 'members' ? [member] : [userObj.id] };
     }
-    if (!sub || sub === 'preview') return { status: 200, body: officialGuildObject(targetGuildId) };
+    if (!sub || sub === 'preview') return { status: 200, body: await officialGuildObject(env, targetGuildId) };
   }
 
   // 11. Channels & Messages
@@ -2339,6 +2488,8 @@ function officialGateway(request: Request, env: Env, ctx: ExecutionContext): Res
   let lastInsertedAt = Date.now();
   // 已经推过的消息（实时推送和心跳轮询都会碰到同一条，只发一次）
   const pushed = new Set<string>();
+  // 客户端要过、当时还没拉到资料的成员：sync-worker 拉到后，下一次心跳用 GUILD_MEMBER_UPDATE 补发（用户名随即变色）
+  const pendingMembers = new Set<string>();
   const push = (type: string, message: Message) => {
     if (!message?.id || (type === 'MESSAGE_CREATE' && pushed.has(message.id))) return;
     pushed.add(message.id);
@@ -2404,6 +2555,50 @@ function officialGateway(request: Request, env: Env, ctx: ExecutionContext): Res
             } catch (_) {}
           }
         } catch (_) {}
+        if (pendingMembers.size) {
+          const found = await readMemberProfiles(env, [...pendingMembers]);
+          for (const [id, stored] of found) {
+            pendingMembers.delete(id);
+            const member = memberWithUser(stored);
+            if (member) send(JSON.stringify({ op: 0, t: 'GUILD_MEMBER_UPDATE', d: { guild_id: GUILD_ID, ...member } }));
+          }
+        }
+        return;
+      }
+
+      // 客户端要成员（消息作者、提及的人、@ 补全）：从 member_meta 回 GUILD_MEMBERS_CHUNK，
+      // 用户名颜色、服务器内昵称和头像都靠它。还没拉到的放进 not_found，并排进 sync-worker 的队列
+      if (packet?.op === 8) {
+        const d = packet.d || {};
+        const guildIds = (Array.isArray(d.guild_id) ? d.guild_id : [d.guild_id]).map(String);
+        if (!guildIds.includes(GUILD_ID)) return;
+        let members: any[] = [];
+        let notFound: string[] = [];
+        if (Array.isArray(d.user_ids)) {
+          const ids = [...new Set<string>(d.user_ids.map(String))].filter((id) => /^\d{15,22}$/.test(id)).slice(0, 100);
+          const found = await readMemberProfiles(env, ids);
+          for (const id of ids) {
+            if (id === VISITOR_USER_ID) {
+              members.push({ user: getMockUser(), roles: [], joined_at: '2024-01-01T00:00:00.000000+00:00', deaf: false, mute: false, flags: 0 });
+              continue;
+            }
+            const member = memberWithUser(found.get(id));
+            if (member) members.push(member);
+            else notFound.push(id);
+          }
+          const missing = ids.filter((id) => id !== VISITOR_USER_ID && !found.has(id));
+          if (missing.length) {
+            for (const id of missing) if (pendingMembers.size < 500) pendingMembers.add(id);
+            ctx.waitUntil(wantMembers(env, missing));
+          }
+        } else if (typeof d.query === 'string') {
+          members = await searchMembers(env, d.query, Math.min(Math.max(Number(d.limit) || 10, 1), 100));
+        }
+        send(JSON.stringify({
+          op: 0,
+          t: 'GUILD_MEMBERS_CHUNK',
+          d: { guild_id: GUILD_ID, members, not_found: notFound, chunk_index: 0, chunk_count: 1, ...(d.nonce ? { nonce: d.nonce } : {}) }
+        }));
         return;
       }
 
@@ -2447,6 +2642,7 @@ function officialGateway(request: Request, env: Env, ctx: ExecutionContext): Res
           }
         }
 
+        const features = await guildFeatures(env);
         const guildProperties = {
           id: guildId,
           name: GUILD_NAME,
@@ -2455,7 +2651,7 @@ function officialGateway(request: Request, env: Env, ctx: ExecutionContext): Res
           splash: null,
           banner: null,
           home_header: null,
-          features: ['COMMUNITY', 'NEWS', 'THREADS_ENABLED'],
+          features,
           preferred_locale: LOCALE,
           owner_id: GUILD_OWNER_ID,
           application_id: null,
@@ -2495,22 +2691,10 @@ function officialGateway(request: Request, env: Env, ctx: ExecutionContext): Res
           description: `${GUILD_NAME} archive`,
           owner_id: GUILD_OWNER_ID,
           permissions: '2147483647',
-          roles: [
-            {
-              id: guildId,
-              name: '@everyone',
-              color: 0,
-              hoist: false,
-              position: 0,
-              permissions: '1071698660929',
-              managed: false,
-              mentionable: false,
-              flags: 0
-            }
-          ],
+          roles: await guildRoles(env, guildId),
           emojis: [],
           stickers: [],
-          features: ['COMMUNITY', 'NEWS', 'THREADS_ENABLED'],
+          features,
           channels,
           members: [
             {
@@ -2685,36 +2869,13 @@ function officialGateway(request: Request, env: Env, ctx: ExecutionContext): Res
         return;
       }
 
-      if (packet?.op === 14) { // LAZY_REQUEST
-        const targetGuildId = packet?.d?.guild_id;
-        if (targetGuildId) {
-          send(JSON.stringify({
-            op: 0,
-            t: 'GUILD_MEMBER_LIST_UPDATE',
-            s: 3,
-            d: {
-              id: 'everyone',
-              guild_id: targetGuildId,
-              ops: [
-                {
-                  op: 'SYNC',
-                  range: [0, 99],
-                  items: [
-                    {
-                      member: {
-                        user: getMockUser(),
-                        roles: [],
-                        presence: { status: 'online', activities: [], client_status: { web: 'online' } }
-                      }
-                    }
-                  ]
-                }
-              ],
-              groups: [{ id: 'online', count: 1 }],
-              online_count: 1,
-              member_count: 1
-            }
-          }));
+      // 成员列表（右侧边栏）：新版客户端用 op 37 订阅，旧版用 op 14；d 里 channels = { 频道 ID: [[0, 99], [100, 199]] }
+      if (packet?.op === 37 || packet?.op === 14) {
+        const subscriptions = packet.op === 37 ? packet?.d?.subscriptions || {} : { [packet?.d?.guild_id]: packet?.d || {} };
+        const channels = subscriptions[GUILD_ID]?.channels || {};
+        for (const [channelId, ranges] of Object.entries(channels)) {
+          if (!Array.isArray(ranges) || !ranges.length) continue;
+          send(JSON.stringify({ op: 0, t: 'GUILD_MEMBER_LIST_UPDATE', d: await memberListUpdate(env, ranges as number[][]) }));
         }
         return;
       }
@@ -3522,9 +3683,7 @@ export default {
     if (
       url.pathname.startsWith('/attachments/') ||
       url.pathname.startsWith('/snapshot-attachments/') ||
-      url.pathname.startsWith('/stickers/') ||
-      url.pathname.startsWith('/emojis/') ||
-      url.pathname.startsWith('/avatars/')
+      CDN_IMAGE_PREFIXES.some((prefix) => url.pathname.startsWith(prefix))
     ) {
       const isProxyAttachment = url.pathname.startsWith(ATTACHMENT_PROXY_PREFIX);
       const proxyToken = isProxyAttachment ? url.pathname.slice(ATTACHMENT_PROXY_PREFIX.length) : '';
@@ -3695,13 +3854,7 @@ export default {
       }
 
       // 9.6 针对头像、表情、图标、贴纸等静态资产直接由边缘回源至 Discord CDN 并入缓存
-      if (
-        url.pathname.startsWith('/avatars/') ||
-        url.pathname.startsWith('/emojis/') ||
-        url.pathname.startsWith('/icons/') ||
-        url.pathname.startsWith('/stickers/') ||
-        url.pathname.startsWith('/guilds/')
-      ) {
+      if (CDN_IMAGE_PREFIXES.some((prefix) => url.pathname.startsWith(prefix))) {
         try {
           const discordCdnUrl = `https://cdn.discordapp.com${url.pathname}${url.search}`;
           const cdnHeaders = new Headers({
