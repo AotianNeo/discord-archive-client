@@ -14,6 +14,9 @@ sync-worker/wrangler.toml
 pages/public/assets/
 pages/public/official-shell.html
 pages/public/fetch-client-missing.txt
+# scripts/boot-bundle.mjs: trace of the current build and the shell before bundling
+pages/boot-trace.json
+pages/official-shell.unbundled.html
 
 # exported data and generated SQL
 export/

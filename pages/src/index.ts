@@ -378,7 +378,31 @@ function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
 }
 
-function renderLoginPage(error = ''): string {
+// 口令页预取官方客户端的脚本和样式（official-shell.html 里列出的，boot-bundle 之后约 15 个文件）：访客输入口令的几秒里
+// 下载完，进入时直接从浏览器缓存读。/assets/* 不经过 Worker，未登录也能取（Discord 客户端代码本来就是公开的）
+let clientFilesCache: string[] | null = null;
+async function clientFiles(env: Env, request: Request): Promise<string[]> {
+  if (clientFilesCache) return clientFilesCache;
+  try {
+    const shell = await (await env.ASSETS.fetch(new Request(new URL('/official-shell', request.url)))).text();
+    const files = [...shell.matchAll(/<script\b[^>]*\bsrc="(\/assets\/[^"]+\.js)"|<link\b[^>]*\bhref="(\/assets\/[^"]+\.css)"[^>]*>/g)]
+      .map((m) => m[1] || m[2]);
+    clientFilesCache = [...new Set(files)];
+  } catch (_) {
+    return [];
+  }
+  return clientFilesCache;
+}
+
+// 首次进入官方客户端时清一次本站 HTTP 缓存（浏览器里按"一年不变"缓存了错尺寸的头像，见 mediaCacheKey）。
+// 口令页就先清掉：否则进入客户端时才清，会把口令页刚预取的客户端文件一起清掉
+function resetMediaCache(headers: Headers, cookies: Record<string, string>): void {
+  if (cookies[MEDIA_RESET_COOKIE] === MEDIA_RESET_VERSION) return;
+  headers.set('Clear-Site-Data', '"cache"');
+  headers.append('Set-Cookie', `${MEDIA_RESET_COOKIE}=${MEDIA_RESET_VERSION}; Path=/; Max-Age=31536000; SameSite=Lax; Secure`);
+}
+
+function renderLoginPage(error = '', prefetch: string[] = []): string {
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -386,6 +410,7 @@ function renderLoginPage(error = ''): string {
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="robots" content="noindex, nofollow, noarchive, nosnippet">
   <title>${escapeHtml(GUILD_NAME)} · 访问验证 / Sign in</title>
+${prefetch.map((href) => `  <link rel="prefetch" href="${escapeHtml(href)}" as="${href.endsWith('.css') ? 'style' : 'script'}">`).join('\n')}
   <style>
     body {
       margin: 0; padding: 0; min-height: 100vh;
@@ -3326,7 +3351,7 @@ export default {
         loginFailures.set(ip, next);
         const headers = new Headers({ 'Content-Type': 'text/html; charset=utf-8' });
         applySecurityHeaders(headers);
-        return new Response(renderLoginPage('密码错误，请重新输入'), { status: 401, headers });
+        return new Response(renderLoginPage('密码错误，请重新输入', await clientFiles(env, request)), { status: 401, headers });
       }
     }
 
@@ -3344,7 +3369,8 @@ export default {
       ) {
         const headers = new Headers({ 'Content-Type': 'text/html; charset=utf-8' });
         applySecurityHeaders(headers);
-        return new Response(renderLoginPage(), { status: 401, headers });
+        resetMediaCache(headers, cookies);
+        return new Response(renderLoginPage('', await clientFiles(env, request)), { status: 401, headers });
       }
       return new Response(JSON.stringify({ error: 'Unauthorized: Access password required' }), {
         status: 401,
@@ -3712,11 +3738,7 @@ export default {
       const officialResp = await env.ASSETS.fetch(officialReq);
       const headers = new Headers(officialResp.headers);
       applySecurityHeaders(headers);
-      // 浏览器里已经按"一年不变"缓存了错尺寸的头像（见 mediaCacheKey），URL 不变就不会重新请求：每个浏览器清一次本站 HTTP 缓存
-      if (cookies[MEDIA_RESET_COOKIE] !== MEDIA_RESET_VERSION) {
-        headers.set('Clear-Site-Data', '"cache"');
-        headers.append('Set-Cookie', `${MEDIA_RESET_COOKIE}=${MEDIA_RESET_VERSION}; Path=/; Max-Age=31536000; SameSite=Lax; Secure`);
-      }
+      resetMediaCache(headers, cookies); // 已登录、没经过口令页的老访客
       return new Response(officialResp.body, { status: officialResp.status, headers });
     }
 

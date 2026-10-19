@@ -88,6 +88,13 @@ npx wrangler secret put DISCORD_TOKEN
 npx wrangler deploy
 ```
 
+Faster first load (recommended, after the site runs locally; see below):
+
+```bash
+node scripts/boot-bundle.mjs trace --base https://127.0.0.1:8787 --cdp 9222 --password <pw>   # headless Chrome
+node scripts/boot-bundle.mjs build --public pages/public && cd pages && npm run build
+```
+
 Local development:
 
 ```bash
@@ -145,6 +152,26 @@ With `REALTIME_GATEWAY = "true"` it instead keeps a **Discord gateway connection
 实时同步：`REALTIME_GATEWAY = "true"` 时由 Durable Object 常驻连接 Discord 网关，新消息约 1 秒推给访客；
 定时任务改为看门狗 + 每 10 分钟 REST 补漏。请使用机器人令牌：实测个人令牌从 Cloudflare 机房登录网关会被 Discord 以 4000 拒绝
 （连续 3 次后暂停 6 小时，期间照常每分钟 REST 轮询）；个人令牌挂网关也属于 self-bot，违反服务条款。
+
+## Faster first load · 首次加载提速
+
+A cold start of Discord's client makes ~2,400 requests: ~670 scripts and stylesheets listed in its HTML, then ~1,700
+chunks its bundler requests once those have run. Each is small, but they queue (two dependent waves), so the first visit
+took ~5 s on a fast connection. `scripts/boot-bundle.mjs` packs them into ~10 files:
+
+- `trace` opens the site in a fresh browser context and records which client files a cold start loads
+  (`--path` adds more pages, e.g. a forum channel). It writes `pages/boot-trace.json`.
+- `build` writes `assets/boot-<hash>.js/.css` and rewrites `official-shell.html` (the original is kept as
+  `pages/official-shell.unbundled.html`). Chunks keep their original order around the client's runtime scripts, and
+  lazily loaded chunks are stored uncalled and run only when the client asks for them, so nothing starts in a different
+  order than before. Files missing from the trace still load on demand.
+- The password page prefetches these files, so most of the download happens while the visitor types.
+
+Re-run both after `fetch-client.mjs` downloads a new client build. Measured on the free plan: first messages after
+submitting the password in ~1.6–2.6 s instead of ~5.2 s.
+
+首次访问原本要发约 2,400 个请求（两波排队），约 5 秒；`boot-bundle.mjs` 把它们打包成约 10 个文件，口令页还会提前预取。
+客户端更新（重新运行 fetch-client）后要重新 trace + build。
 
 ## Cloudflare free plan · 免费版注意事项
 
