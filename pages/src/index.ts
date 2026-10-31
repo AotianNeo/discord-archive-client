@@ -268,6 +268,38 @@ function normalizeDiscordMessage(raw: any, channelId: string): Message | null {
   };
 }
 
+let allowedChannelsCache: { at: number; ids: Set<string> } | null = null;
+
+// 越权读取防护：只允许操作本归档服务器已记录的频道与帖子（metadata.channels / thread_meta / sync_status），
+// 严禁访客传入任意私聊（DM）或外部服务器的 channelId 触发 DISCORD_TOKEN 回源读取。
+async function isAllowedArchiveChannel(env: Env, channelId: string): Promise<boolean> {
+  if (!/^\d{15,22}$/.test(channelId)) return false;
+  if (!allowedChannelsCache || Date.now() - allowedChannelsCache.at >= 60_000) {
+    const ids = new Set<string>();
+    try {
+      const [groups, threads, synced] = await Promise.all([
+        readChannelMetadata(env),
+        readThreadMeta(env),
+        env.DB.prepare('SELECT channel_id FROM sync_status').all<{ channel_id: string }>().catch(() => ({ results: [] as Array<{ channel_id: string }> }))
+      ]);
+      for (const group of groups) {
+        for (const ch of group.channels || []) {
+          if (ch?.id) ids.add(String(ch.id));
+        }
+      }
+      for (const thread of threads) {
+        if (thread?.id) ids.add(String(thread.id));
+        if (thread?.parent_id) ids.add(String(thread.parent_id));
+      }
+      for (const row of synced.results || []) {
+        if (row?.channel_id) ids.add(String(row.channel_id));
+      }
+    } catch (_) {}
+    allowedChannelsCache = { at: Date.now(), ids };
+  }
+  return allowedChannelsCache.ids.has(channelId);
+}
+
 function uniqueSortedMessages(messages: Message[]): Message[] {
   const byId = new Map<string, Message>();
   for (const message of messages) {
@@ -1551,6 +1583,7 @@ async function threadLatestMessages(env: Env, threads: ThreadMeta[], origin: str
 }
 
 async function readOfficialArchiveMessages(channelId: string, url: URL, env: Env): Promise<any[]> {
+  if (!(await isAllowedArchiveChannel(env, channelId))) return [];
   const requested = Number.parseInt(url.searchParams.get('limit') || '50', 10);
   const limit = Number.isFinite(requested) ? Math.max(1, Math.min(requested, 100)) : 50;
   const before = url.searchParams.get('before') || '';
@@ -1997,6 +2030,14 @@ const SEARCH_FORWARD_PARAMS = new Set([
 ]);
 
 async function officialSearchBody(url: URL, env: Env, scope: 'guilds' | 'channels', scopeId: string): Promise<OfficialResult> {
+  if (scope === 'guilds' ? scopeId !== GUILD_ID : !(await isAllowedArchiveChannel(env, scopeId))) {
+    return { status: 403, body: { message: 'Missing Access', code: 50001 } };
+  }
+  for (const cid of url.searchParams.getAll('channel_id')) {
+    if (!(await isAllowedArchiveChannel(env, cid))) {
+      return { status: 403, body: { message: 'Missing Access', code: 50001 } };
+    }
+  }
   const desc = url.searchParams.get('sort_order') !== 'asc';
   const toHits = (messages: Message[]) => messages.map((message) => [{ ...archiveMessageToDiscord(message, url.origin), hit: true }]);
   if (env.DISCORD_TOKEN) {
@@ -2276,6 +2317,7 @@ async function officialApiBody(url: URL, env: Env, request?: Request): Promise<{
   if (guildMatch && method !== 'GET') return READ_ONLY;
   if (guildMatch) {
     const targetGuildId = guildMatch[1];
+    if (targetGuildId !== guildId) return { status: 404, body: { message: 'Unknown Guild', code: 10004 } };
     const sub = guildMatch[2];
     if (sub === 'messages/search') return officialSearchBody(url, env, 'guilds', targetGuildId);
     const groups = await readChannelMetadata(env);
@@ -2859,6 +2901,8 @@ async function discordAttachmentSourceFromDescriptor(parsed: AttachmentDescripto
   const channelId = parsed.channelId!;
   const messageId = parsed.messageId!;
   const attachmentId = parsed.attachmentId!;
+  if (!(await isAllowedArchiveChannel(env, channelId))) return '';
+  if (!(await readArchiveMessage(env, channelId, messageId))) return '';
   try {
     const headers = {
       Authorization: env.DISCORD_TOKEN,
@@ -2965,6 +3009,19 @@ async function syncChannelMessages(
   message?: string;
   cooldown_remaining_sec?: number;
 }> {
+  if (!(await isAllowedArchiveChannel(env, channelId))) {
+    return {
+      ok: false,
+      status: 'forbidden',
+      channel_id: channelId,
+      new_count: 0,
+      messages: [],
+      message: '非本归档服务器频道，拒绝同步',
+      refreshed_at: new Date().toISOString(),
+      complete: true,
+      fetched_count: 0
+    };
+  }
   const now = Date.now();
   const continuation = Boolean(requestedAfter);
   let syncRow: {
