@@ -154,6 +154,9 @@ export function toRecord(raw: any, channelId: string, ownerId = '0') {
       url: `/stickers/${st.id}.${Number(st.format_type) === 3 ? 'json' : Number(st.format_type) === 4 ? 'gif' : 'png'}`
     })),
     message_type: Number(raw.type || 0),
+    ...(raw.author?.bot ? { is_bot: true } : {}),
+    ...(raw.flags ? { flags: Number(raw.flags) } : {}),
+    ...(Array.isArray(raw.components) && raw.components.length > 0 ? { components: raw.components } : {}),
     remote: true
   };
 }

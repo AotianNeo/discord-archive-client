@@ -98,6 +98,8 @@ interface Message {
   reply_author_avatar?: string;
   mention_users?: any[];
   snapshots?: ArchiveSnapshot[];
+  flags?: number;
+  components?: any[];
 }
 
 interface Attachment {
@@ -185,6 +187,17 @@ function searchText(m: Message): string {
       snapshots += ' ' + (e.title || '') + ' ' + (e.description || '');
     }
   }
+  const walkComps = (comps: any[] | undefined): void => {
+    for (const c of comps || []) {
+      if (!c || typeof c !== 'object') continue;
+      if (typeof c.content === 'string') snapshots += ' ' + c.content;
+      if (typeof c.name === 'string') snapshots += ' ' + c.name;
+      if (typeof c.label === 'string') snapshots += ' ' + c.label;
+      if (Array.isArray(c.components)) walkComps(c.components);
+      if (c.accessory && typeof c.accessory === 'object') walkComps([c.accessory]);
+    }
+  };
+  walkComps(m.components);
   return lower(parts.join(' ') + ' ' + snapshots);
 }
 
@@ -264,7 +277,10 @@ function normalizeDiscordMessage(raw: any, channelId: string): Message | null {
     attachments: atts,
     embeds: ems,
     stickers: stickersFromDiscord(raw),
-    message_type: Number(raw.type || 0)
+    message_type: Number(raw.type || 0),
+    ...(author.bot || raw.is_bot ? { is_bot: true } : {}),
+    ...(raw.flags ? { flags: Number(raw.flags) } : {}),
+    ...(Array.isArray(raw.components) && raw.components.length > 0 ? { components: raw.components } : {})
   };
 }
 
@@ -765,9 +781,51 @@ async function hydrateAttachments(env: Env, messages: Message[]): Promise<Messag
     }
     return attachment;
   });
+  const collectComponents = (comps: any[] | undefined): void => {
+    for (const comp of comps || []) {
+      if (!comp || typeof comp !== 'object') continue;
+      if (comp.type === 13 && comp.file && typeof comp.file === 'object') {
+        const rawUrl = comp.file.url || comp.file.proxy_url || '';
+        const id = String(comp.file.attachment_id || attachmentIdFromUrl(rawUrl) || '');
+        if (/^\d{15,22}$/.test(id) && rawUrl) {
+          byId.set(id, [...(byId.get(id) || []), {
+            id,
+            filename: comp.name || '附件',
+            url: rawUrl,
+            content_type: comp.file.content_type || 'application/octet-stream',
+            size: comp.size || 0,
+            width: comp.file.width || null,
+            height: comp.file.height || null
+          }]);
+        }
+      }
+      if (comp.media && typeof comp.media === 'object') {
+        const rawUrl = comp.media.url || comp.media.proxy_url || '';
+        const id = String(comp.media.attachment_id || attachmentIdFromUrl(rawUrl) || '');
+        if (/^\d{15,22}$/.test(id) && rawUrl) {
+          byId.set(id, [...(byId.get(id) || []), { id, filename: 'media', url: rawUrl, content_type: comp.media.content_type, width: comp.media.width, height: comp.media.height }]);
+        }
+      }
+      if (Array.isArray(comp.items)) {
+        for (const item of comp.items) {
+          if (item?.media && typeof item.media === 'object') {
+            const rawUrl = item.media.url || item.media.proxy_url || '';
+            const id = String(item.media.attachment_id || attachmentIdFromUrl(rawUrl) || '');
+            if (/^\d{15,22}$/.test(id) && rawUrl) {
+              byId.set(id, [...(byId.get(id) || []), { id, filename: 'media', url: rawUrl, content_type: item.media.content_type, width: item.media.width, height: item.media.height }]);
+            }
+          }
+        }
+      }
+      if (Array.isArray(comp.components)) collectComponents(comp.components);
+      if (comp.accessory && typeof comp.accessory === 'object') collectComponents([comp.accessory]);
+      if (comp.component && typeof comp.component === 'object') collectComponents([comp.component]);
+    }
+  };
   for (const message of messages) {
     message.attachments = collect(message.attachments);
     for (const snapshot of message.snapshots || []) snapshot.attachments = collect(snapshot.attachments);
+    collectComponents(message.components);
   }
   if (!byId.size) return messages;
 
@@ -1304,6 +1362,65 @@ async function userProfileBody(env: Env, userId: string, guildId: string): Promi
   };
 }
 
+function localizeComponentMedia(media: any, message: Message, origin: string, fallbackName = '附件'): any {
+  if (!media || typeof media !== 'object') return media;
+  const rawUrl = media.url || media.proxy_url || '';
+  const attId = String(media.attachment_id || attachmentIdFromUrl(rawUrl) || media.id || '');
+  const localized = rawUrl
+    ? localizedAttachmentUrl(rawUrl, message.id, message.channel_id, {
+        id: attId,
+        filename: fallbackName,
+        url: rawUrl,
+        content_type: media.content_type
+      })
+    : '';
+  const finalUrl = origin && localized.startsWith('/') ? `${origin}${localized}` : (localized || rawUrl);
+  return {
+    ...media,
+    url: finalUrl,
+    proxy_url: finalUrl,
+    loading_state: media.loading_state ?? 2
+  };
+}
+
+function localizeComponents(components: any[], message: Message, origin = ''): any[] {
+  const base = origin || '';
+  const rewriteLink = (u: string): string =>
+    u.replace(/^https:\/\/(?:ptb\.|canary\.)?discord\.com\/channels\//i, `${base}/channels/`);
+  const walk = (list: any[]): any[] =>
+    (Array.isArray(list) ? list : []).map((comp) => {
+      if (!comp || typeof comp !== 'object') return comp;
+      const next: any = { ...comp };
+      if (typeof next.url === 'string') {
+        next.url = rewriteLink(next.url);
+      }
+      if (next.type === 13 && next.file && typeof next.file === 'object') {
+        next.file = localizeComponentMedia(next.file, message, origin, next.name || '附件');
+      }
+      if (next.media && typeof next.media === 'object') {
+        next.media = localizeComponentMedia(next.media, message, origin, 'media');
+      }
+      if (Array.isArray(next.items)) {
+        next.items = next.items.map((item: any) =>
+          item && typeof item === 'object' && item.media
+            ? { ...item, media: localizeComponentMedia(item.media, message, origin, 'media') }
+            : item
+        );
+      }
+      if (Array.isArray(next.components)) {
+        next.components = walk(next.components);
+      }
+      if (next.accessory && typeof next.accessory === 'object') {
+        next.accessory = walk([next.accessory])[0];
+      }
+      if (next.component && typeof next.component === 'object') {
+        next.component = walk([next.component])[0];
+      }
+      return next;
+    });
+  return walk(components);
+}
+
 function archiveMessageToDiscord(message: Message, origin = ''): any {
   const loc = localizeMessage(message);
 
@@ -1343,6 +1460,10 @@ function archiveMessageToDiscord(message: Message, origin = ''): any {
   // 回复：官方客户端只对 type 19 + message_reference 画回复条（之前是 type 0，所有回复都没有引用）
   const reply = !forward && Boolean(message.reply_message_id);
   const replyKnown = reply && Boolean(message.reply_author || message.reply_content);
+  const hasComponentsV2 = (Number(message.flags || 0) & 32768) !== 0;
+  const components = Array.isArray(message.components) && message.components.length > 0
+    ? localizeComponents(message.components, message, origin)
+    : undefined;
 
   return {
     id: message.id,
@@ -1372,8 +1493,9 @@ function archiveMessageToDiscord(message: Message, origin = ''): any {
       format_type: Number(sticker.format_type) || 1
     })),
     pinned: false,
-    flags: forward ? 16384 : 0, // HAS_SNAPSHOT
+    flags: (forward ? 16384 : 0) | (hasComponentsV2 ? 32768 : 0),
     type: reply && type === 0 ? 19 : type,
+    ...(components ? { components } : {}),
     ...(forward ? {
       message_reference: {
         type: MESSAGE_REFERENCE_FORWARD,
@@ -3310,7 +3432,10 @@ async function syncChannelMessages(
         reply_message_id: raw.message_reference?.message_id,
         attachments: atts,
         embeds: ems,
-        stickers: stickersFromDiscord(raw)
+        stickers: stickersFromDiscord(raw),
+        ...(raw.author?.bot || raw.is_bot ? { is_bot: true } : {}),
+        ...(raw.flags ? { flags: Number(raw.flags) } : {}),
+        ...(Array.isArray(raw.components) && raw.components.length > 0 ? { components: raw.components } : {})
       });
     }
   }
@@ -3670,6 +3795,9 @@ export default {
             embeds: ems,
             stickers: raw.stickers || stickersFromDiscord(raw),
             message_type: Number(raw.message_type || raw.type || 0),
+            ...(raw.author?.bot || raw.is_bot ? { is_bot: true } : {}),
+            ...(raw.flags ? { flags: Number(raw.flags) } : {}),
+            ...(Array.isArray(raw.components) && raw.components.length > 0 ? { components: raw.components } : {}),
             remote: true
           };
 

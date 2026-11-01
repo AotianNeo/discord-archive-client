@@ -111,6 +111,8 @@ def to_record(raw, channel_id, owner_id, channel_names):
                       'url': sticker_url(s)} for s in raw.get('sticker_items') or []],
         'message_type': int(raw.get('type') or 0),
         'is_bot': bool(author.get('bot')),
+        **({'flags': int(raw['flags'])} if raw.get('flags') else {}),
+        **({'components': raw['components']} if raw.get('components') else {}),
     }
     ref = raw.get('message_reference') or {}
     if ref.get('type') == 1 and raw.get('message_snapshots'):
