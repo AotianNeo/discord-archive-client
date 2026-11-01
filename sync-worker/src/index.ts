@@ -76,7 +76,7 @@ const MAX_CHANNEL_FETCHES_PER_RUN = 4; // 有新消息的频道每轮最多拉 4
 // 令牌无权读取的频道（返回 403）：记 24 小时，期间不再请求。键为频道 ID（拉消息）或 threads:<频道 ID>（查帖子，
 // 机器人令牌不能用 threads/search，不能因此连消息都不拉）。
 // 之前它们每轮都排在队列最前，403 后被 discord-guard 停 10 分钟，被拒绝的请求又让整轮循环提前结束，帖子一直轮不上
-const FORBIDDEN_TTL_MS = 24 * 3600_000;
+const FORBIDDEN_TTL_MS = 30 * 60_000;
 
 async function readForbidden(env: Env): Promise<Record<string, number>> {
   const row = await env.DB.prepare("SELECT payload FROM metadata WHERE name = 'forbidden_channels'").first<{ payload: unknown }>();
@@ -265,8 +265,9 @@ export async function syncAllChannels(env: Env): Promise<{
       }
       const records = batch.map((raw) => toRecord(raw, ch.id, GUILD_OWNER_ID));
       const maxId = records[records.length - 1].id;
-      await env.DB.batch(writeRecords(env.DB, ch.id, records));
-      if (batch.length < FETCH_LIMIT) upToDate.push(ch.id);
+      const isComplete = batch.length < FETCH_LIMIT;
+      await env.DB.batch(writeRecords(env.DB, ch.id, records, Date.now(), isComplete));
+      if (isComplete) upToDate.push(ch.id);
       results.push({ id: ch.id, name: ch.name, count: records.length, max_id: maxId });
       console.log(`[CloudSync] 频道 #${ch.name} 写入 ${records.length} 条新消息 (最新 ID: ${maxId})`);
     } catch (err: any) {

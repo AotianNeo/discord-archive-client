@@ -161,9 +161,10 @@ export function toRecord(raw: any, channelId: string, ownerId = '0') {
 export type ArchiveRecord = ReturnType<typeof toRecord>;
 
 // 写入 message_cache（按 (channel, message_id) 覆盖）并推进该频道的 sync_status
-export function writeRecords(db: D1Database, channelId: string, records: ArchiveRecord[], now = Date.now()): D1PreparedStatement[] {
+export function writeRecords(db: D1Database, channelId: string, records: ArchiveRecord[], now = Date.now(), complete = true): D1PreparedStatement[] {
   if (!records.length) return [];
   const maxId = records.reduce((max, r) => (compareSnowflake(r.id, max) > 0 ? r.id : max), records[0].id);
+  const refreshedAt = complete ? now : 0;
   return [
     ...records.map((r) => db.prepare(
       'INSERT INTO message_cache (channel, message_id, created_at, payload, inserted_at) VALUES (?, ?, ?, ?, ?) ' +
@@ -172,6 +173,6 @@ export function writeRecords(db: D1Database, channelId: string, records: Archive
     db.prepare(
       'INSERT INTO sync_status (channel_id, last_refreshed_at, latest_message_id) VALUES (?, ?, ?) ' +
       'ON CONFLICT(channel_id) DO UPDATE SET last_refreshed_at = excluded.last_refreshed_at, latest_message_id = MAX(sync_status.latest_message_id, excluded.latest_message_id)'
-    ).bind(channelId, now, maxId)
+    ).bind(channelId, refreshedAt, maxId)
   ];
 }
