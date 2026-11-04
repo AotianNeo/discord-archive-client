@@ -515,9 +515,9 @@ ${prefetch.map((href) => `  <link rel="prefetch" href="${escapeHtml(href)}" as="
 
 const SYNC_PAGE_SIZE = 100;
 const SYNC_MAX_PAGES = 5;
-// 访客触发的增量同步冷却。sync-worker 每分钟把所有有新消息的频道同步一遍并刷新 last_refreshed_at，
-// 冷却比 cron 间隔长，访客打开频道时就不会再额外请求 Discord（只有子区和 cron 停摆时才会触发）
-const SYNC_COOLDOWN_MS = 90_000;
+// 访客触发的增量同步冷却。sync-worker 每分钟把所有有新消息的频道同步一遍并按需刷新 cron_heartbeat，
+// 冷却比 heartbeat 间隔（5 分钟）长，访客打开频道时就不会再额外写锁或请求 Discord
+const SYNC_COOLDOWN_MS = 10 * 60_000;
 
 function maxSnowflake(a = '', b = ''): string {
   if (!a) return b;
@@ -843,9 +843,7 @@ async function hydrateAttachments(env: Env, messages: Message[]): Promise<Messag
     return messages; // attachment_meta 尚未建表
   }
 
-  const now = Date.now();
   const inserts: D1PreparedStatement[] = [];
-  const stale: Array<{ id: string; source: string }> = [];
   for (const [id, list] of byId) {
     const meta = known.get(id);
     for (const attachment of list) {
@@ -863,11 +861,9 @@ async function hydrateAttachments(env: Env, messages: Message[]): Promise<Messag
         'INSERT OR IGNORE INTO attachment_meta (id, source, filename, content_type, size, width, height) VALUES (?, ?, ?, ?, ?, ?, ?)'
       ).bind(id, source, first.filename || '附件', first.content_type || 'application/octet-stream', first.size ?? null, first.width ?? null, first.height ?? null));
     }
-    if (!meta || meta.fresh_expires < now + 10 * 60_000) stale.push({ id, source });
   }
   try {
     if (inserts.length) await env.DB.batch(inserts);
-    if (stale.length) await refreshAttachmentUrls(env, stale.slice(0, 100));
   } catch (err) {
     console.warn('[Media] 附件元数据预取失败:', err);
   }
@@ -3139,6 +3135,19 @@ async function syncChannelMessages(
       new_count: 0,
       messages: [],
       message: '非本归档服务器频道，拒绝同步',
+      refreshed_at: new Date().toISOString(),
+      complete: true,
+      fetched_count: 0
+    };
+  }
+  if (!env.DISCORD_TOKEN && !env.ORIGIN_URL) {
+    return {
+      ok: false,
+      status: 'upstream_unavailable',
+      channel_id: channelId,
+      new_count: 0,
+      messages: [],
+      message: '由独立 sync-worker 负责定时同步，前端节点未配置直连令牌',
       refreshed_at: new Date().toISOString(),
       complete: true,
       fetched_count: 0

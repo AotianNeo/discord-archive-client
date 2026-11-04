@@ -51,20 +51,23 @@ async function runMinute(env: Env, scheduledTime: number): Promise<void> {
       console.warn('[Gateway] 看门狗请求失败:', err.message || err);
     }
     const healthy = status?.state === 'ready' && Date.now() - Number(status.lastEventAt || 0) < GATEWAY_HEALTHY_MS;
+    const minuteSlot = Math.floor(scheduledTime / 60_000);
     // 网关状态写进 D1：Workers 请求额度用完时 HTTP 状态页打不开，也能从 metadata.gateway_status 查
     if (status) {
       console.log(`[Gateway] ${status.state} messages=${status.messages} reconnects=${status.reconnects} subscribers=${status.subscribers} ` +
         `identifies24h=${status.identifies24h}${status.lastClose ? ` last_close="${status.lastClose}"` : ''}`);
-      await env.DB.prepare(
-        "INSERT INTO metadata (name, payload) VALUES ('gateway_status', ?) ON CONFLICT(name) DO UPDATE SET payload = excluded.payload"
-      ).bind(JSON.stringify({ ...status, checkedAt: Date.now() })).run();
+      if (minuteSlot % 5 === 0) {
+        await env.DB.prepare(
+          "INSERT INTO metadata (name, payload) VALUES ('gateway_status', ?) ON CONFLICT(name) DO UPDATE SET payload = excluded.payload"
+        ).bind(JSON.stringify({ ...status, checkedAt: Date.now() })).run();
+      }
     }
-    if (healthy && Math.floor(scheduledTime / 60_000) % BACKSTOP_EVERY_MINUTES !== 0) {
-      await touchHeartbeat(env);
+    if (healthy && minuteSlot % BACKSTOP_EVERY_MINUTES !== 0) {
+      if (minuteSlot % 5 === 0) await touchHeartbeat(env);
       return;
     }
   }
-  await syncAllChannels(env);
+  await syncAllChannels(env, scheduledTime);
 }
 
 let GUILD_OWNER_ID = '0';
@@ -99,10 +102,18 @@ async function markForbidden(env: Env, forbidden: Record<string, number>, channe
 // 帖子/子区：用户令牌不能用 /guilds/:id/threads/active（仅限机器人），官方客户端靠网关推送活跃帖子，
 // 所以只靠一次性导出的话，活跃的帖子可能一条都没有，已有帖子的新回复也不会更新。
 // 每轮只发一个 threads/search：奇数轮查论坛的活跃帖子（论坛约 2 分钟刷新一次），
-// 偶数轮轮转查论坛已归档帖子和文字频道的子区。新帖写入 thread_meta，有新消息的帖子和频道共用本轮拉取名额。
+// 偶数轮轮转查论坛已归档帖子和文字频道的子区。仅把新增或有变化的帖子写入 thread_meta，避免每分钟无条件覆盖 25 行耗尽 D1 写入配额。
 interface ThreadInfo { id: string; name: string; last_message_id: string }
+interface KnownThread { id: string; name: string; last_message_id: string; archived: number; synced: string | null; archived_to: string | null }
 
-async function discoverThreads(env: Env, listed: any[], headers: Record<string, string>, forbidden: Record<string, number>): Promise<ThreadInfo[]> {
+async function discoverThreads(
+  env: Env,
+  listed: any[],
+  headers: Record<string, string>,
+  forbidden: Record<string, number>,
+  knownThreads: Map<string, KnownThread>,
+  scheduledTime = Date.now()
+): Promise<ThreadInfo[]> {
   const searchable = (c: any) => !forbidden[c.id] && !forbidden[`threads:${c.id}`];
   const forums = listed.filter((c) => [15, 16].includes(Number(c.type)) && searchable(c));
   const texts = listed.filter((c) => [0, 5].includes(Number(c.type)) && searchable(c));
@@ -111,22 +122,15 @@ async function discoverThreads(env: Env, listed: any[], headers: Record<string, 
     ...texts.map((c): [any, boolean] => [c, false]),
     ...texts.map((c): [any, boolean] => [c, true])
   ];
-  const row = await env.DB.prepare("SELECT payload FROM metadata WHERE name = 'thread_discovery'").first<{ payload: unknown }>();
-  let state: { run?: number; forum?: number; rest?: number } = {};
-  try { state = row ? JSON.parse(typeof row.payload === 'string' ? row.payload : new TextDecoder().decode(row.payload as ArrayBuffer)) : {}; } catch (_) {}
-  const run = (state.run || 0) + 1;
+  const run = Math.max(1, Math.floor(scheduledTime / 60_000));
+  const turn = Math.floor(run / 2);
   const useForum = forums.length > 0 && (run % 2 === 1 || !rest.length);
   let target: [any, boolean] | undefined;
   if (useForum) {
-    target = [forums[(state.forum || 0) % forums.length], false];
-    state.forum = ((state.forum || 0) + 1) % forums.length;
+    target = [forums[turn % forums.length], false];
   } else if (rest.length) {
-    target = rest[(state.rest || 0) % rest.length];
-    state.rest = ((state.rest || 0) + 1) % rest.length;
+    target = rest[turn % rest.length];
   }
-  await env.DB.prepare(
-    "INSERT INTO metadata (name, payload) VALUES ('thread_discovery', ?) ON CONFLICT(name) DO UPDATE SET payload = excluded.payload"
-  ).bind(JSON.stringify({ ...state, run })).run();
   if (!target) return [];
 
   const [parent, archived] = target;
@@ -139,22 +143,41 @@ async function discoverThreads(env: Env, listed: any[], headers: Record<string, 
   }
   const data: any = await resp.json();
   const threads = (Array.isArray(data?.threads) ? data.threads : []).filter((t: any) => t?.id && t.last_message_id);
-  if (threads.length) {
-    await env.DB.batch(threads.map((t: any) => env.DB.prepare(
+  const changedThreads = threads.filter((t: any) => {
+    const id = String(t.id);
+    const name = String(t.name || '');
+    const lastId = String(t.last_message_id);
+    const isArchived = t.thread_metadata?.archived ? 1 : 0;
+    const existing = knownThreads.get(id);
+    if (!existing) {
+      knownThreads.set(id, { id, name, last_message_id: lastId, archived: isArchived, synced: null, archived_to: null });
+      return true;
+    }
+    const newer = compareSnowflake(lastId, existing.last_message_id) > 0;
+    if (newer) existing.last_message_id = lastId;
+    if (newer || existing.name !== name || existing.archived !== isArchived) {
+      existing.name = name;
+      existing.archived = isArchived;
+      return true;
+    }
+    return false;
+  });
+  if (changedThreads.length) {
+    await env.DB.batch(changedThreads.map((t: any) => env.DB.prepare(
       'INSERT INTO thread_meta (id, parent_id, name, owner_id, message_count, last_message_id, archived) VALUES (?, ?, ?, ?, ?, ?, ?) ' +
       'ON CONFLICT(id) DO UPDATE SET name = excluded.name, message_count = MAX(thread_meta.message_count, excluded.message_count), archived = excluded.archived, ' +
       'last_message_id = CASE WHEN CAST(excluded.last_message_id AS INTEGER) > CAST(thread_meta.last_message_id AS INTEGER) THEN excluded.last_message_id ELSE thread_meta.last_message_id END'
     ).bind(String(t.id), String(t.parent_id || parent.id), String(t.name || ''), String(t.owner_id || ''), Number(t.message_count || 0),
       String(t.last_message_id), t.thread_metadata?.archived ? 1 : 0)));
   }
-  console.log(`[CloudSync] #${parent.name} ${archived ? '已归档' : '活跃'}帖子 ${threads.length} 个`);
+  console.log(`[CloudSync] #${parent.name} ${archived ? '已归档' : '活跃'}帖子 ${threads.length} 个 (更新 ${changedThreads.length} 个)`);
   return threads.map((t: any) => ({ id: String(t.id), name: String(t.name || ''), last_message_id: String(t.last_message_id) }));
 }
 
 // 每分钟：先用 1 个请求拿到全部频道的 last_message_id，只拉真正有新消息的频道（之前每分钟固定连打 7 个频道）。
-// 所有 Discord 请求走 discordFetch：跨 Worker 共享预算，429/401/403 后按 D1 里记录的时间避让。
+// 所有 Discord 请求走 discordFetch：跨 Worker 共享避让状态，429/401/403 后按 D1 里记录的时间避让。
 // 跑完写 metadata.cron_heartbeat（已是最新的频道列表），Pages 那边访客打开这些频道时不再另外请求 Discord。
-export async function syncAllChannels(env: Env): Promise<{
+export async function syncAllChannels(env: Env, scheduledTime = Date.now()): Promise<{
   timestamp: string;
   total_new_messages: number;
   channels_synced: Array<{ id: string; name: string; count: number; max_id: string }>;
@@ -214,20 +237,22 @@ export async function syncAllChannels(env: Env): Promise<{
   const priority = new Set((env.PRIORITY_CHANNEL_IDS || '').split(',').map((id) => id.trim()).filter(Boolean));
   changed.sort((a, b) => Number(priority.has(b.id)) - Number(priority.has(a.id)));
 
+  // 帖子是否落后只看 D1（thread_meta 由 discoverThreads 按需更新），先读出已知帖子以便过滤无变化的写入
+  const threadRows = (await env.DB.prepare(
+    'SELECT t.id, t.name, t.last_message_id, COALESCE(t.archived, 0) AS archived, s.latest_message_id AS synced, ' +
+    '(SELECT CAST(last_id AS TEXT) FROM block_index b WHERE b.channel = t.id ORDER BY seq DESC LIMIT 1) AS archived_to ' +
+    'FROM thread_meta t LEFT JOIN sync_status s ON s.channel_id = t.id'
+  ).all<KnownThread>()).results || [];
+  const knownThreads = new Map<string, KnownThread>();
+  for (const t of threadRows) knownThreads.set(t.id, { ...t, archived: Number(t.archived) || 0 });
+
   try {
-    await discoverThreads(env, Array.isArray(listed) ? listed : [], headers, forbidden);
+    await discoverThreads(env, Array.isArray(listed) ? listed : [], headers, forbidden, knownThreads, scheduledTime);
   } catch (err: any) {
     console.warn('[CloudSync] 帖子列表跳过:', err.message);
   }
-  // 帖子是否落后只看 D1（thread_meta 由 discoverThreads 更新），不用每轮都等发现到它；
-  // 之前帖子排在频道后面，活跃频道每分钟占满 4 个名额，新帖一直轮不上
   const threadChanged: Array<{ id: string; name: string; after: string; target: string }> = [];
-  const threadRows = (await env.DB.prepare(
-    'SELECT t.id, t.name, t.last_message_id, s.latest_message_id AS synced, ' +
-    '(SELECT CAST(last_id AS TEXT) FROM block_index b WHERE b.channel = t.id ORDER BY seq DESC LIMIT 1) AS archived_to ' +
-    'FROM thread_meta t LEFT JOIN sync_status s ON s.channel_id = t.id'
-  ).all<{ id: string; name: string; last_message_id: string; synced: string | null; archived_to: string | null }>()).results || [];
-  for (const t of threadRows) {
+  for (const t of knownThreads.values()) {
     // 新帖子从头拉（帖子消息不多）；导出过的帖子从归档最后一条接着拉
     const after = t.synced || (t.archived_to ? String(t.archived_to) : '0');
     if (compareSnowflake(String(t.last_message_id), after) > 0) threadChanged.push({ id: t.id, name: t.name, after, target: String(t.last_message_id) });
@@ -286,9 +311,11 @@ export async function syncAllChannels(env: Env): Promise<{
     await fetchOne(ch);
   }
 
-  await env.DB.prepare(
-    'INSERT INTO metadata (name, payload) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET payload = excluded.payload'
-  ).bind('cron_heartbeat', JSON.stringify({ at: Date.now(), channels: upToDate })).run();
+  if (results.length > 0 || Math.floor(scheduledTime / 60_000) % 5 === 0) {
+    await env.DB.prepare(
+      'INSERT INTO metadata (name, payload) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET payload = excluded.payload'
+    ).bind('cron_heartbeat', JSON.stringify({ at: Date.now(), channels: upToDate })).run();
+  }
   return done();
 }
 

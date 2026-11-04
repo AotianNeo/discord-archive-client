@@ -29,6 +29,9 @@ const INVALID_LIMIT = 30;
 const MIN_GAP_MS = 350;
 
 const tableReady = new WeakMap<D1Database, Promise<void>>();
+const blockCache = new WeakMap<D1Database, { fetchedAt: number; blocked: Map<string, number> }>();
+const windowCounters = new Map<string, { window: number; count: number }>();
+const BLOCK_CACHE_TTL_MS = 15_000;
 let nextSlot = 0;
 
 function ensureTable(env: GuardEnv): Promise<void> {
@@ -59,16 +62,45 @@ function routeBudget(route: string): number {
   return ROUTE_PER_MINUTE[route] ?? DEFAULT_ROUTE_PER_MINUTE;
 }
 
-function countStatement(env: GuardEnv, scope: string, window: number) {
-  return env.DB.prepare(
-    'INSERT INTO discord_rate (scope, window_start, window_count) VALUES (?, ?, 1) ON CONFLICT(scope) DO UPDATE SET ' +
-    'window_count = CASE WHEN window_start = excluded.window_start THEN window_count + 1 ELSE 1 END, window_start = excluded.window_start ' +
-    'RETURNING blocked_until, window_count'
-  ).bind(scope, window);
+function incrementWindow(scope: string, window: number): number {
+  const cur = windowCounters.get(scope);
+  if (!cur || cur.window !== window) {
+    windowCounters.set(scope, { window, count: 1 });
+    if (windowCounters.size > 500) {
+      for (const [k, v] of windowCounters) {
+        if (v.window < window - 1) windowCounters.delete(k);
+      }
+    }
+    return 1;
+  }
+  cur.count += 1;
+  return cur.count;
+}
+
+async function readBlockedScopes(env: GuardEnv, now: number): Promise<Map<string, number>> {
+  const cached = blockCache.get(env.DB);
+  if (cached && now - cached.fetchedAt < BLOCK_CACHE_TTL_MS) {
+    return cached.blocked;
+  }
+  await ensureTable(env);
+  const rows = await env.DB.prepare(
+    'SELECT scope, blocked_until FROM discord_rate WHERE blocked_until > ?'
+  ).bind(now).all<{ scope: string; blocked_until: number }>();
+  const blocked = new Map<string, number>();
+  for (const row of rows.results || []) {
+    blocked.set(row.scope, Number(row.blocked_until) || 0);
+  }
+  blockCache.set(env.DB, { fetchedAt: now, blocked });
+  return blocked;
 }
 
 async function block(env: GuardEnv, scope: string, until: number, note: string): Promise<void> {
   console.warn(`[DiscordGuard] ${scope} 暂停到 ${new Date(until).toISOString()}: ${note}`);
+  const cached = blockCache.get(env.DB);
+  if (cached) {
+    cached.blocked.set(scope, Math.max(cached.blocked.get(scope) || 0, until));
+  }
+  await ensureTable(env);
   await env.DB.prepare(
     'INSERT INTO discord_rate (scope, blocked_until, note) VALUES (?, ?, ?) ON CONFLICT(scope) DO UPDATE SET ' +
     'blocked_until = MAX(blocked_until, excluded.blocked_until), note = excluded.note'
@@ -76,30 +108,30 @@ async function block(env: GuardEnv, scope: string, until: number, note: string):
 }
 
 async function countInvalid(env: GuardEnv, now: number): Promise<void> {
-  const row = await countStatement(env, 'invalid', Math.floor(now / 600_000)).first<{ window_count: number }>();
-  if ((row?.window_count || 0) > INVALID_LIMIT) {
-    await block(env, 'global', now + 600_000, `10 分钟内 ${row!.window_count} 次 401/403/429`);
+  const count = incrementWindow('invalid', Math.floor(now / 600_000));
+  if (count > INVALID_LIMIT) {
+    await block(env, 'global', now + 600_000, `10 分钟内 ${count} 次 401/403/429`);
   }
 }
 
 async function admit(env: GuardEnv, route: string): Promise<void> {
-  await ensureTable(env);
   const now = Date.now();
   const minute = Math.floor(now / 60_000);
-  const [global, perRoute] = (await env.DB.batch<{ blocked_until: number; window_count: number }>([
-    countStatement(env, 'global', minute),
-    countStatement(env, `route:${route}`, minute)
-  ])).map((r) => r.results?.[0]);
-  const blockedUntil = Math.max(global?.blocked_until || 0, perRoute?.blocked_until || 0);
+  const blocked = await readBlockedScopes(env, now);
+  const globalBlocked = blocked.get('global') || 0;
+  const routeBlocked = blocked.get(`route:${route}`) || 0;
+  const blockedUntil = Math.max(globalBlocked, routeBlocked);
   if (blockedUntil > now) {
     throw new DiscordRateLimited(`Discord 请求避让中（${route}），${Math.ceil((blockedUntil - now) / 1000)} 秒后恢复`, (blockedUntil - now) / 1000,
-      (global?.blocked_until || 0) > now);
+      globalBlocked > now);
   }
   const untilNextMinute = ((minute + 1) * 60_000 - now) / 1000;
-  if ((global?.window_count || 0) > GLOBAL_PER_MINUTE) {
+  const globalCount = incrementWindow('global', minute);
+  if (globalCount > GLOBAL_PER_MINUTE) {
     throw new DiscordRateLimited(`Discord 全局请求预算已用完（每分钟 ${GLOBAL_PER_MINUTE} 次）`, untilNextMinute);
   }
-  if ((perRoute?.window_count || 0) > routeBudget(route)) {
+  const routeCount = incrementWindow(`route:${route}`, minute);
+  if (routeCount > routeBudget(route)) {
     throw new DiscordRateLimited(`Discord 请求预算已用完（${route} 每分钟 ${routeBudget(route)} 次）`, untilNextMinute, false);
   }
   // 同一实例内排队错开，并发调用（Promise.all）也不会同时发出
